@@ -9,9 +9,14 @@
 #import <objc/message.h>
 #import "IOSMCPPreferences.h"
 #import "MCPLogger.h"
+#import <fcntl.h>
 #import <spawn.h>
 #import <string.h>
 #import <sys/stat.h>
+#import <sys/wait.h>
+#import <unistd.h>
+
+extern char **environ;
 
 typedef struct __SecCode const *SecStaticCodeRef;
 typedef CF_OPTIONS(uint32_t, MCPSecCSFlags) {
@@ -298,6 +303,347 @@ static NSString *MCPConfiguredSudoPassword(void) {
         CFRelease(value);
     }
     return @"alpine";
+}
+
+static NSString *MCPBootstrapArgumentPath(NSString *path);
+
+static NSString *MCPDpkgBootstrapPathForDeb(NSString *path) {
+    if (!path.isAbsolutePath || ![path.pathExtension.lowercaseString isEqualToString:@"deb"]) {
+        return path ?: @"";
+    }
+
+#ifdef MCP_ROOTHIDE
+    NSFileManager *fm = [NSFileManager defaultManager];
+
+    NSString *systemPathFromBootstrap = jbroot(path);
+    if (systemPathFromBootstrap.length > 0 &&
+        [fm fileExistsAtPath:systemPathFromBootstrap]) {
+        return path;
+    }
+
+    if ([fm fileExistsAtPath:path]) {
+        NSString *bootstrapPath = rootfs(path);
+        return bootstrapPath.length > 0 ? bootstrapPath : path;
+    }
+
+    NSString *bootstrapPath = rootfs(path);
+    return bootstrapPath.length > 0 ? bootstrapPath : path;
+#else
+    return path;
+#endif
+}
+
+static NSArray<NSString *> *MCPDpkgBootstrapArguments(NSArray<NSString *> *dpkgArguments) {
+    NSMutableArray<NSString *> *convertedArguments = [NSMutableArray arrayWithCapacity:dpkgArguments.count];
+    for (NSString *argument in dpkgArguments) {
+        NSString *converted = argument;
+        if (argument.isAbsolutePath &&
+            [argument.pathExtension.lowercaseString isEqualToString:@"deb"]) {
+            converted = MCPDpkgBootstrapPathForDeb(argument);
+        }
+        [convertedArguments addObject:converted ?: @""];
+    }
+    return convertedArguments;
+}
+
+static BOOL MCPDpkgOutputLooksLikeHelperPrivilegeFailure(NSString *output, int exitCode) {
+    if (exitCode == 111) return YES;
+    if (![output isKindOfClass:[NSString class]] || output.length == 0) return NO;
+    return [output rangeOfString:@"setgid(0) failed"].location != NSNotFound ||
+           [output rangeOfString:@"setuid(0) failed"].location != NSNotFound ||
+           [output rangeOfString:@"dpkg package does not exist:"].location != NSNotFound;
+}
+
+static BOOL MCPRunDpkgWithPrivileges(NSArray<NSString *> *dpkgArguments,
+                                     NSTimeInterval timeout,
+                                     NSUInteger maxOutputBytes,
+                                     NSString **output,
+                                     int *exitCode,
+                                     NSString **errorMessage) {
+    if (output) *output = @"";
+    if (exitCode) *exitCode = -1;
+    if (errorMessage) *errorMessage = nil;
+
+    NSArray<NSString *> *bootstrapDpkgArguments = MCPDpkgBootstrapArguments(dpkgArguments);
+    NSMutableArray<NSString *> *helperArguments = [NSMutableArray arrayWithObject:@"/usr/bin/dpkg"];
+    if (bootstrapDpkgArguments.count > 0) {
+        [helperArguments addObjectsFromArray:bootstrapDpkgArguments];
+    }
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *mcpRootPath = MCPResolvedJailbreakPath(@"/usr/bin/mcp-root");
+    NSString *helperOutput = nil;
+    NSString *helperError = nil;
+    int helperExitCode = -1;
+    BOOL helperFinished = NO;
+
+    if ([fm isExecutableFileAtPath:mcpRootPath]) {
+        helperFinished = MCPRunProcess(mcpRootPath,
+                                       helperArguments,
+                                       MCPJailbreakEnvironment(),
+                                       timeout,
+                                       maxOutputBytes,
+                                       &helperOutput,
+                                       &helperExitCode,
+                                       &helperError);
+        if (helperFinished && helperExitCode == 0) {
+            if (output) *output = helperOutput;
+            if (exitCode) *exitCode = helperExitCode;
+            if (errorMessage) *errorMessage = helperError;
+            return YES;
+        }
+
+        if (!MCPDpkgOutputLooksLikeHelperPrivilegeFailure(helperOutput, helperExitCode)) {
+            if (output) *output = helperOutput;
+            if (exitCode) *exitCode = helperExitCode;
+            if (errorMessage) *errorMessage = helperError;
+            return helperFinished;
+        }
+
+        APP_LOG(@"mcp-root dpkg privilege failed, trying sudo fallback (exit=%d outputBytes=%lu)",
+                helperExitCode,
+                (unsigned long)MCPAppLogUTF8Length(helperOutput));
+    }
+
+    NSString *sudoPath = MCPResolvedJailbreakPath(@"/usr/bin/sudo");
+    NSString *shellPath = MCPResolvedJailbreakPath(@"/bin/sh");
+    NSString *dpkgPath = MCPResolvedJailbreakPath(@"/usr/bin/dpkg");
+    if (![fm isExecutableFileAtPath:sudoPath]) {
+        if (output) *output = helperOutput ?: @"";
+        if (exitCode) *exitCode = helperExitCode;
+        if (errorMessage) {
+            *errorMessage = helperError ?: @"mcp-root privilege escalation failed and sudo is not available";
+        }
+        return helperFinished;
+    }
+    if (![fm isExecutableFileAtPath:shellPath]) {
+        shellPath = @"/bin/sh";
+    }
+    if (![fm isExecutableFileAtPath:dpkgPath]) {
+        if (output) *output = helperOutput ?: @"";
+        if (exitCode) *exitCode = helperExitCode;
+        if (errorMessage) *errorMessage = @"dpkg executable not found";
+        return NO;
+    }
+
+    NSMutableArray<NSString *> *parts = [NSMutableArray arrayWithObjects:
+                                         @"printf '%s\\n'",
+                                         MCPShellQuote(MCPConfiguredSudoPassword()),
+                                         @"|",
+                                         MCPShellQuote(sudoPath),
+                                         @"-k",
+                                         @"-S",
+                                         @"-p",
+                                         @"''",
+                                         MCPShellQuote(dpkgPath),
+                                         nil];
+    for (NSString *argument in bootstrapDpkgArguments) {
+        [parts addObject:MCPShellQuote(argument)];
+    }
+    NSString *command = [parts componentsJoinedByString:@" "];
+
+    NSString *sudoOutput = nil;
+    NSString *sudoError = nil;
+    int sudoExitCode = -1;
+    BOOL sudoFinished = MCPRunProcess(shellPath,
+                                      @[@"-lc", command],
+                                      MCPJailbreakEnvironment(),
+                                      timeout,
+                                      maxOutputBytes,
+                                      &sudoOutput,
+                                      &sudoExitCode,
+                                      &sudoError);
+    if (output) *output = sudoOutput;
+    if (exitCode) *exitCode = sudoExitCode;
+    if (errorMessage) {
+        if (sudoError.length > 0) {
+            *errorMessage = sudoError;
+        } else if (!sudoFinished && helperOutput.length > 0) {
+            *errorMessage = [NSString stringWithFormat:@"mcp-root failed: %@", helperOutput];
+        }
+    }
+    return sudoFinished;
+}
+
+static BOOL MCPWriteFileToShellPath(NSString *sourcePath, NSString *destPath, NSString **output, NSString **errorMessage) {
+    if (output) *output = @"";
+    if (errorMessage) *errorMessage = nil;
+    if (!sourcePath.length || !destPath.length) {
+        if (errorMessage) *errorMessage = @"Missing source or destination path";
+        return NO;
+    }
+
+    int sourceFD = open(sourcePath.fileSystemRepresentation, O_RDONLY);
+    if (sourceFD < 0) {
+        if (errorMessage) *errorMessage = [NSString stringWithFormat:@"Failed to open source DEB: %s", strerror(errno)];
+        return NO;
+    }
+
+    NSString *shellPath = MCPResolvedJailbreakPath(@"/bin/sh");
+    if (![[NSFileManager defaultManager] isExecutableFileAtPath:shellPath]) {
+        shellPath = @"/bin/sh";
+    }
+
+    NSString *parent = destPath.stringByDeletingLastPathComponent;
+    NSString *command = [NSString stringWithFormat:@"mkdir -p %@ && cat > %@ && chmod 0644 %@",
+                         MCPShellQuote(parent),
+                         MCPShellQuote(destPath),
+                         MCPShellQuote(destPath)];
+
+    int stdinPipe[2] = {-1, -1};
+    int outputPipe[2] = {-1, -1};
+    if (pipe(stdinPipe) != 0) {
+        close(sourceFD);
+        if (errorMessage) *errorMessage = [NSString stringWithFormat:@"stdin pipe failed: %s", strerror(errno)];
+        return NO;
+    }
+    if (pipe(outputPipe) != 0) {
+        close(sourceFD);
+        close(stdinPipe[0]);
+        close(stdinPipe[1]);
+        if (errorMessage) *errorMessage = [NSString stringWithFormat:@"output pipe failed: %s", strerror(errno)];
+        return NO;
+    }
+
+    posix_spawn_file_actions_t actions;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_adddup2(&actions, stdinPipe[0], STDIN_FILENO);
+    posix_spawn_file_actions_adddup2(&actions, outputPipe[1], STDOUT_FILENO);
+    posix_spawn_file_actions_adddup2(&actions, outputPipe[1], STDERR_FILENO);
+    posix_spawn_file_actions_addclose(&actions, stdinPipe[1]);
+    posix_spawn_file_actions_addclose(&actions, outputPipe[0]);
+
+    const char *shell = shellPath.fileSystemRepresentation;
+    char *const argv[] = {
+        (char *)(shellPath.lastPathComponent.UTF8String ?: "sh"),
+        "-lc",
+        (char *)(command.UTF8String ?: ""),
+        NULL
+    };
+
+    pid_t pid = 0;
+    int spawnStatus = posix_spawn(&pid, shell, &actions, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    close(stdinPipe[0]);
+    close(outputPipe[1]);
+
+    if (spawnStatus != 0) {
+        close(sourceFD);
+        close(stdinPipe[1]);
+        close(outputPipe[0]);
+        if (errorMessage) *errorMessage = [NSString stringWithFormat:@"posix_spawn shell failed: %s", strerror(spawnStatus)];
+        return NO;
+    }
+
+    BOOL writeFailed = NO;
+    int savedErrno = 0;
+    uint8_t fileBuffer[65536];
+    while (1) {
+        ssize_t bytesRead = read(sourceFD, fileBuffer, sizeof(fileBuffer));
+        if (bytesRead < 0 && errno == EINTR) continue;
+        if (bytesRead < 0) {
+            writeFailed = YES;
+            savedErrno = errno;
+            break;
+        }
+        if (bytesRead == 0) break;
+
+        uint8_t *cursor = fileBuffer;
+        ssize_t remaining = bytesRead;
+        while (remaining > 0) {
+            ssize_t written = write(stdinPipe[1], cursor, (size_t)remaining);
+            if (written < 0 && errno == EINTR) continue;
+            if (written <= 0) {
+                writeFailed = YES;
+                savedErrno = errno;
+                remaining = 0;
+                break;
+            }
+            cursor += written;
+            remaining -= written;
+        }
+        if (writeFailed) break;
+    }
+    close(sourceFD);
+    close(stdinPipe[1]);
+
+    NSMutableData *captured = [NSMutableData data];
+    char buffer[4096];
+    ssize_t n = 0;
+    while ((n = read(outputPipe[0], buffer, sizeof(buffer))) > 0) {
+        if (captured.length < 64 * 1024) {
+            NSUInteger allowed = MIN((NSUInteger)n, (64 * 1024) - captured.length);
+            [captured appendBytes:buffer length:allowed];
+        }
+    }
+    close(outputPipe[0]);
+
+    int status = 0;
+    int waitStatus = waitpid(pid, &status, 0);
+    NSString *capturedOutput = [[NSString alloc] initWithData:captured encoding:NSUTF8StringEncoding] ?: @"";
+    if (output) *output = capturedOutput;
+
+    if (writeFailed) {
+        if (errorMessage) *errorMessage = [NSString stringWithFormat:@"Failed to stream staged DEB: %s %@", strerror(savedErrno), MCPAppLogRedactedText(capturedOutput)];
+        return NO;
+    }
+    if (waitStatus < 0) {
+        if (errorMessage) *errorMessage = [NSString stringWithFormat:@"waitpid failed: %s", strerror(errno)];
+        return NO;
+    }
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        if (errorMessage) *errorMessage = [NSString stringWithFormat:@"staging shell failed: %@", MCPAppLogRedactedText(capturedOutput)];
+        return NO;
+    }
+    return YES;
+}
+
+static void MCPRemoveShellPath(NSString *path) {
+    if (!path.length) return;
+    NSString *shellPath = MCPResolvedJailbreakPath(@"/bin/sh");
+    if (![[NSFileManager defaultManager] isExecutableFileAtPath:shellPath]) {
+        shellPath = @"/bin/sh";
+    }
+    NSString *command = [NSString stringWithFormat:@"rm -f %@", MCPShellQuote(path)];
+    NSString *output = nil;
+    NSString *runError = nil;
+    int exitCode = -1;
+    MCPRunProcess(shellPath,
+                  @[@"-lc", command],
+                  MCPJailbreakEnvironment(),
+                  10,
+                  64 * 1024,
+                  &output,
+                  &exitCode,
+                  &runError);
+}
+
+static NSString *MCPStageDebForDpkg(NSString *debPath, NSString **stagedPath, NSString **stageError) {
+    if (stagedPath) *stagedPath = nil;
+    if (stageError) *stageError = nil;
+
+    if (!debPath.length) {
+        if (stageError) *stageError = @"Empty DEB path";
+        return nil;
+    }
+
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:debPath]) {
+        if (stageError) *stageError = [NSString stringWithFormat:@"DEB file not found: %@", debPath];
+        return nil;
+    }
+
+    NSString *fileName = [NSString stringWithFormat:@"ios-mcp-dpkg-%@.deb", [[NSUUID UUID] UUIDString]];
+    NSString *visiblePath = [@"/var/tmp" stringByAppendingPathComponent:fileName];
+    NSString *stageOutput = nil;
+    NSString *writeError = nil;
+    if (!MCPWriteFileToShellPath(debPath, visiblePath, &stageOutput, &writeError)) {
+        if (stageError) *stageError = writeError ?: stageOutput ?: @"Failed to stage DEB for dpkg";
+        return nil;
+    }
+
+    if (stagedPath) *stagedPath = visiblePath;
+    return visiblePath;
 }
 
 static NSString *MCPBootstrapArgumentPath(NSString *path) {
@@ -1473,25 +1819,27 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
         return NO;
     }
 
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *mcpRootPath = MCPResolvedJailbreakPath(@"/usr/bin/mcp-root");
-    if (![fm isExecutableFileAtPath:mcpRootPath]) {
-        if (error) *error = @"mcp-root executable not found; DEB install requires the bundled root helper";
+    NSString *stageError = nil;
+    NSString *stagedDebPath = nil;
+    NSString *dpkgDebPath = MCPStageDebForDpkg(debPath, &stagedDebPath, &stageError);
+    if (!dpkgDebPath.length) {
+        if (error) *error = stageError ?: @"Failed to stage DEB for dpkg";
         return NO;
     }
 
-    APP_LOG(@"Installing DEB via mcp-root -> dpkg: %@", MCPAppLogSafePath(debPath));
+    APP_LOG(@"Installing DEB via privileged dpkg: %@", MCPAppLogSafePath(debPath));
     NSString *output = nil;
     NSString *spawnError = nil;
     int exitCode = -1;
-    BOOL finished = MCPRunProcess(mcpRootPath,
-                                  @[@"/usr/bin/dpkg", @"-i", debPath],
-                                  MCPJailbreakEnvironment(),
-                                  180,
-                                  512 * 1024,
-                                  &output,
-                                  &exitCode,
-                                  &spawnError);
+    BOOL finished = MCPRunDpkgWithPrivileges(@[@"-i", dpkgDebPath],
+                                             180,
+                                             512 * 1024,
+                                             &output,
+                                             &exitCode,
+                                             &spawnError);
+    if (stagedDebPath.length > 0) {
+        MCPRemoveShellPath(stagedDebPath);
+    }
     if (!finished || exitCode != 0) {
         APP_LOG(@"dpkg install failed (spawnError=%@ exit=%d outputBytes=%lu)",
                 MCPAppLogRedactedText(spawnError ?: @"none"),
@@ -1984,18 +2332,16 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
     return result;
 }
 
-- (BOOL)debPackageInstalled:(NSString *)packageId mcpRootPath:(NSString *)mcpRootPath statusOutput:(NSString **)statusOutput error:(NSString **)error {
+- (BOOL)debPackageInstalled:(NSString *)packageId statusOutput:(NSString **)statusOutput error:(NSString **)error {
     NSString *output = nil;
     NSString *spawnError = nil;
     int exitCode = -1;
-    BOOL finished = MCPRunProcess(mcpRootPath,
-                                  @[@"/usr/bin/dpkg", @"-s", packageId],
-                                  MCPJailbreakEnvironment(),
-                                  30,
-                                  128 * 1024,
-                                  &output,
-                                  &exitCode,
-                                  &spawnError);
+    BOOL finished = MCPRunDpkgWithPrivileges(@[@"-s", packageId],
+                                             30,
+                                             128 * 1024,
+                                             &output,
+                                             &exitCode,
+                                             &spawnError);
     if (statusOutput) *statusOutput = output;
 
     if (!finished) {
@@ -2021,16 +2367,9 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
         return NO;
     }
 
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSString *mcpRootPath = MCPResolvedJailbreakPath(@"/usr/bin/mcp-root");
-    if (![fm isExecutableFileAtPath:mcpRootPath]) {
-        if (error) *error = @"mcp-root executable not found; DEB uninstall requires the bundled root helper";
-        return NO;
-    }
-
     NSString *statusOutput = nil;
     NSString *statusError = nil;
-    if (![self debPackageInstalled:packageId mcpRootPath:mcpRootPath statusOutput:&statusOutput error:&statusError]) {
+    if (![self debPackageInstalled:packageId statusOutput:&statusOutput error:&statusError]) {
         if (error) {
             NSString *details = statusError.length ? statusError : statusOutput;
             *error = details.length > 0 ?
@@ -2040,18 +2379,16 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
         return NO;
     }
 
-    APP_LOG(@"Uninstalling DEB via mcp-root -> dpkg: %@", packageId);
+    APP_LOG(@"Uninstalling DEB via privileged dpkg: %@", packageId);
     NSString *output = nil;
     NSString *spawnError = nil;
     int exitCode = -1;
-    BOOL finished = MCPRunProcess(mcpRootPath,
-                                  @[@"/usr/bin/dpkg", @"-r", packageId],
-                                  MCPJailbreakEnvironment(),
-                                  180,
-                                  512 * 1024,
-                                  &output,
-                                  &exitCode,
-                                  &spawnError);
+    BOOL finished = MCPRunDpkgWithPrivileges(@[@"-r", packageId],
+                                             180,
+                                             512 * 1024,
+                                             &output,
+                                             &exitCode,
+                                             &spawnError);
     if (!finished || exitCode != 0) {
         APP_LOG(@"dpkg remove failed for %@ (spawnError=%@ exit=%d outputBytes=%lu)",
                 packageId,
@@ -2063,7 +2400,7 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
         return NO;
     }
 
-    if ([self debPackageInstalled:packageId mcpRootPath:mcpRootPath statusOutput:nil error:nil]) {
+    if ([self debPackageInstalled:packageId statusOutput:nil error:nil]) {
         if (error) *error = [NSString stringWithFormat:@"dpkg remove completed but package is still installed: %@", packageId];
         return NO;
     }

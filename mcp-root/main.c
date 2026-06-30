@@ -89,6 +89,22 @@ static int canonicalize_existing_path(const char *path, char *buffer, size_t siz
     return 1;
 }
 
+static int canonicalize_existing_bootstrap_path(const char *path, char *buffer, size_t size) {
+    if (canonicalize_existing_path(path, buffer, size)) {
+        return 1;
+    }
+
+#ifdef MCP_ROOTHIDE
+    const char *systemPath = jbroot(path);
+    if (systemPath && systemPath[0] != '\0' &&
+        canonicalize_existing_path(systemPath, buffer, size)) {
+        return 1;
+    }
+#endif
+
+    return 0;
+}
+
 static int paths_match(const char *lhs, const char *rhs) {
     if (!lhs || !rhs) {
         return 0;
@@ -186,7 +202,7 @@ static int path_is_deb_file(const char *path) {
         return 0;
     }
 
-    if (!canonicalize_existing_path(path, resolvedPath, sizeof(resolvedPath))) {
+    if (!canonicalize_existing_bootstrap_path(path, resolvedPath, sizeof(resolvedPath))) {
         fprintf(stderr, "dpkg package does not exist: %s\n", path);
         return 0;
     }
