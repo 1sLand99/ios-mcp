@@ -44,6 +44,14 @@
     } \
 } while (0)
 
+static void MCPSetCloseOnExec(int fd) {
+    if (fd < 0) return;
+    int flags = fcntl(fd, F_GETFD, 0);
+    if (flags >= 0) {
+        fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+    }
+}
+
 static BOOL MCPNumberFromArgs(NSDictionary *args, NSString *key, double defaultValue, BOOL required, double *outValue, NSString **outError) {
     id value = args[key];
     if (!value || value == [NSNull null]) {
@@ -766,6 +774,7 @@ static NSDictionary *MCPElementSummary(NSDictionary *element) {
         MCP_LOG(@"Failed to create socket: %s", strerror(errno));
         return;
     }
+    MCPSetCloseOnExec(sock);
 
     int reuse = 1;
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
@@ -801,6 +810,7 @@ static NSDictionary *MCPElementSummary(NSDictionary *element) {
         if (!self) return;
         int client = accept(sock, NULL, NULL);
         if (client >= 0) {
+            MCPSetCloseOnExec(client);
             dispatch_async(self->_clientQueue, ^{
                 [self handleClient:client];
             });
