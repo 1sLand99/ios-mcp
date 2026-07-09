@@ -72,7 +72,7 @@ http://设备IP:8090/health
 3. 返回以下内容表示服务启动正常：
 
 ```json
-{"status":"ok","server":"ios-mcp","version":"1.2.1","protocolVersion":"2025-11-25","supportedProtocolVersions":["2025-11-25","2025-06-18","2025-03-26"]}
+{"status":"ok","server":"ios-mcp","version":"1.2.2","protocolVersion":"2025-11-25","supportedProtocolVersions":["2025-11-25","2025-06-18","2025-03-26"]}
 ```
 
 ## 使用
