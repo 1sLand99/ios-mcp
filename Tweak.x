@@ -50,8 +50,10 @@ static BOOL ios_mcp_is_springboard_process(void) {
     return [bundleIdentifier isEqualToString:@"com.apple.springboard"];
 }
 
-static void ios_mcp_start_server(void) {
-    [[MCPServer sharedInstance] startOnPort:IOS_MCP_DEFAULT_PORT];
+static uint16_t ios_mcp_start_server(void) {
+    uint16_t port = IOSMCPConfiguredPort();
+    [[MCPServer sharedInstance] startOnPort:port];
+    return port;
 }
 
 static void ios_mcp_stop_server(void) {
@@ -69,8 +71,8 @@ static void ios_mcp_handle_control_notification(CFNotificationCenterRef center,
 
     if (CFEqual(name, IOS_MCP_DARWIN_NOTIFICATION_START)) {
         ios_mcp_write_enabled_preference(YES);
-        ios_mcp_start_server();
-        IOS_MCP_LOG(@"Received start request from Settings");
+        uint16_t port = ios_mcp_start_server();
+        IOS_MCP_LOG(@"Received start request from Settings on port %u", (unsigned int)port);
         return;
     }
 
@@ -99,10 +101,11 @@ static void ios_mcp_autostart_if_needed(NSString *reason) {
         return;
     }
 
-    IOS_MCP_LOG(@"Auto-start attempt (%@) on port %d...",
+    uint16_t port = IOSMCPConfiguredPort();
+    IOS_MCP_LOG(@"Auto-start attempt (%@) on port %u...",
                 reason ?: @"unknown",
-                IOS_MCP_DEFAULT_PORT);
-    ios_mcp_start_server();
+                (unsigned int)port);
+    [[MCPServer sharedInstance] startOnPort:port];
 
     if (!server.isRunning) {
         IOS_MCP_LOG(@"Auto-start attempt (%@) did not start server; later retry may recover",

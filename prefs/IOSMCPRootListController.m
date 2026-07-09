@@ -3,15 +3,25 @@
 #import <UIKit/UIKit.h>
 #import <spawn.h>
 #include <string.h>
-#include <stdlib.h>
-#include <sys/wait.h>
 #include <roothide.h>
 #import "../IOSMCPPreferences.h"
 #import "../MCPLogger.h"
 
-@interface IOSMCPRootListController ()
+@interface IOSMCPRootListController () <UIGestureRecognizerDelegate, UITextFieldDelegate>
 
 @property (nonatomic, assign) BOOL serverRunning;
+@property (nonatomic, strong) UITapGestureRecognizer *keyboardDismissTapGesture;
+@property (nonatomic, weak) id<UITextFieldDelegate> originalPortTextFieldDelegate;
+
+- (void)applyPortChangeFromPort:(uint16_t)previousPort toPort:(uint16_t)newPort;
+- (void)configurePortTextField;
+- (void)dismissKeyboardFromTap:(UITapGestureRecognizer *)gestureRecognizer;
+- (void)installKeyboardDismissGestureIfNeeded;
+- (BOOL)isPortTextField:(UITextField *)textField;
+- (UITableViewCell *)portPreferenceCell;
+- (void)portTextFieldDidEndOnExit:(UITextField *)textField;
+- (void)respringButtonTapped:(id)sender;
+- (UITextField *)textFieldInView:(UIView *)view;
 
 @end
 
@@ -45,6 +55,22 @@ static uint32_t IOSMCPCRC32(NSData *data) {
     return crc ^ 0xffffffffU;
 }
 
+static NSString *IOSMCPKillallPath(void) {
+    NSArray<NSString *> *candidatePaths = @[
+        jbroot(@"/usr/bin/killall") ?: @"",
+        jbroot(@"/bin/killall") ?: @"",
+        @"/usr/bin/killall",
+        @"/bin/killall"
+    ];
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    for (NSString *path in candidatePaths) {
+        if (path.length > 0 && [fileManager isExecutableFileAtPath:path]) {
+            return path;
+        }
+    }
+    return nil;
+}
+
 @implementation IOSMCPRootListController
 
 - (NSArray *)specifiers {
@@ -57,10 +83,20 @@ static uint32_t IOSMCPCRC32(NSData *data) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"重启"
-                                                                              style:UIBarButtonItemStylePlain
-                                                                             target:self
-                                                                             action:@selector(respringDevice:)];
+    UIButton *respringButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    respringButton.frame = CGRectMake(0.0, 0.0, 52.0, 44.0);
+    respringButton.contentHorizontalAlignment = UIControlContentHorizontalAlignmentRight;
+    respringButton.titleLabel.font = [UIFont systemFontOfSize:17.0];
+    UIColor *tintColor = self.navigationController.navigationBar.tintColor ?: self.view.tintColor;
+    if (tintColor) {
+        [respringButton setTitleColor:tintColor forState:UIControlStateNormal];
+    }
+    [respringButton setTitle:@"重启" forState:UIControlStateNormal];
+    [respringButton addTarget:self
+                       action:@selector(respringButtonTapped:)
+             forControlEvents:UIControlEventTouchUpInside];
+    self.navigationItem.rightBarButtonItem = [[UIBarButtonItem alloc] initWithCustomView:respringButton];
+    [self installKeyboardDismissGestureIfNeeded];
 }
 
 - (void)viewWillAppear:(BOOL)animated {
@@ -68,18 +104,83 @@ static uint32_t IOSMCPCRC32(NSData *data) {
     [self refreshPromptText];
     [self refreshDebugLogFooter];
     [self refreshServerStatus];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self configurePortTextField];
+    });
+}
+
+- (void)viewDidLayoutSubviews {
+    [super viewDidLayoutSubviews];
+    [self installKeyboardDismissGestureIfNeeded];
+    [self configurePortTextField];
+}
+
+- (id)readPreferenceValue:(PSSpecifier *)specifier {
+    NSString *key = [specifier propertyForKey:@"key"];
+    if ([key isEqualToString:IOS_MCP_PORT_PREFERENCE_KEY]) {
+        return [NSString stringWithFormat:@"%u", (unsigned int)IOSMCPConfiguredPort()];
+    }
+
+    return [super readPreferenceValue:specifier];
+}
+
+- (void)setPreferenceValue:(id)value specifier:(PSSpecifier *)specifier {
+    NSString *key = [specifier propertyForKey:@"key"];
+    if (![key isEqualToString:IOS_MCP_PORT_PREFERENCE_KEY]) {
+        [super setPreferenceValue:value specifier:specifier];
+        return;
+    }
+
+    uint16_t previousPort = IOSMCPConfiguredPort();
+    uint16_t newPort = IOS_MCP_DEFAULT_PORT;
+    BOOL validPort = IOSMCPParsePortValue(value, &newPort);
+
+    if (validPort && previousPort == newPort) {
+        return;
+    }
+
+    CFPreferencesSetAppValue((__bridge CFStringRef)IOS_MCP_PORT_PREFERENCE_KEY,
+                             (__bridge CFPropertyListRef)@(newPort),
+                             (__bridge CFStringRef)IOS_MCP_PREFERENCES_DOMAIN);
+    CFPreferencesAppSynchronize((__bridge CFStringRef)IOS_MCP_PREFERENCES_DOMAIN);
+
+    [MCPLogger log:@"prefs_port updated previous=%u current=%u valid=%@",
+     (unsigned int)previousPort,
+     (unsigned int)newPort,
+     validPort ? @"YES" : @"NO"];
+
+    [self reloadSpecifier:specifier animated:NO];
+    [self refreshPromptText];
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self configurePortTextField];
+    });
+
+    if (!validPort) {
+        [self showAlertWithTitle:@"端口无效"
+                         message:[NSString stringWithFormat:@"端口必须在 %d-%d 之间，已恢复为默认端口 %d。",
+                                  IOS_MCP_MIN_PORT,
+                                  IOS_MCP_MAX_PORT,
+                                  IOS_MCP_DEFAULT_PORT]];
+    }
+
+    if (previousPort != newPort && self.serverRunning) {
+        [self applyPortChangeFromPort:previousPort toPort:newPort];
+    } else {
+        [self refreshServerStatus];
+    }
 }
 
 - (void)toggleServer:(PSSpecifier *)specifier {
     BOOL shouldStart = !self.serverRunning;
+    uint16_t port = IOSMCPConfiguredPort();
     [self updateEnabledPreference:shouldStart];
     [self postNotification:shouldStart ? IOS_MCP_DARWIN_NOTIFICATION_START : IOS_MCP_DARWIN_NOTIFICATION_STOP];
-    [self updateControlStatusText:shouldStart ? @"当前状态：正在启动..." : @"当前状态：正在关闭..."
+    [self updateControlStatusText:shouldStart ? [NSString stringWithFormat:@"当前状态：正在启动端口 %u...", (unsigned int)port] : @"当前状态：正在关闭..."
                       buttonTitle:shouldStart ? @"正在启动..." : @"正在关闭..."
                     buttonEnabled:NO];
 
     [self showAlertWithTitle:shouldStart ? @"iOS MCP 已启动" : @"iOS MCP 已关闭"
-                     message:shouldStart ? @"服务已经启动，并会在下次 SpringBoard 启动后自动开启。"
+                     message:shouldStart ? [NSString stringWithFormat:@"服务已经在端口 %u 启动，并会在下次 SpringBoard 启动后自动开启。", (unsigned int)port]
                                         : @"服务已经停止，并会保持关闭状态，直到你再次手动启动。"];
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(800 * NSEC_PER_MSEC)),
@@ -568,18 +669,36 @@ static uint32_t IOSMCPCRC32(NSData *data) {
                      message:error.localizedDescription ?: @"无法清空 Debug 日志文件。"];
 }
 
-- (void)respringDevice:(PSSpecifier *)specifier {
+- (void)respringButtonTapped:(id)sender {
     UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"重启 SpringBoard"
                                                                   message:@"确定要重启 SpringBoard 吗？重启后需要重新解锁设备。"
                                                            preferredStyle:UIAlertControllerStyleAlert];
     [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"重启" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+    [alert addAction:[UIAlertAction actionWithTitle:@"重启" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *action) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(300 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
-            pid_t pid;
-            const char *argv[] = {"killall", "SpringBoard", NULL};
-            NSString *killallPath = jbroot(@"/usr/bin/killall");
-            const char *spawnPath = killallPath.length ? killallPath.fileSystemRepresentation : "/usr/bin/killall";
-            posix_spawn(&pid, spawnPath, NULL, NULL, (char *const *)argv, NULL);
+            NSString *killallPath = IOSMCPKillallPath();
+            if (!killallPath.length) {
+                [MCPLogger log:@"prefs_respring failed reason=missing_killall"];
+                [self showAlertWithTitle:@"重启失败" message:@"未找到可执行的 killall。"];
+                return;
+            }
+
+            pid_t pid = 0;
+            const char *argv[] = {"killall", "-9", "SpringBoard", NULL};
+            int status = posix_spawn(&pid,
+                                     killallPath.fileSystemRepresentation,
+                                     NULL,
+                                     NULL,
+                                     (char *const *)argv,
+                                     NULL);
+            if (status != 0) {
+                [MCPLogger log:@"prefs_respring failed status=%d error=%s", status, strerror(status)];
+                [self showAlertWithTitle:@"重启失败"
+                                 message:[NSString stringWithFormat:@"无法执行 killall：%s", strerror(status)]];
+                return;
+            }
+
+            [MCPLogger log:@"prefs_respring spawned pid=%d path=%@", pid, killallPath];
         });
     }]];
     [self presentViewController:alert animated:YES completion:nil];
@@ -620,7 +739,8 @@ static uint32_t IOSMCPCRC32(NSData *data) {
                       buttonTitle:@"检测中..."
                     buttonEnabled:NO];
 
-    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"http://127.0.0.1:%d/health", IOS_MCP_DEFAULT_PORT]];
+    uint16_t port = IOSMCPConfiguredPort();
+    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"http://127.0.0.1:%u/health", (unsigned int)port]];
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
     request.timeoutInterval = 1.0;
     request.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
@@ -642,7 +762,8 @@ static uint32_t IOSMCPCRC32(NSData *data) {
         BOOL running = [self isHealthyServerResponseData:data response:response error:error];
         dispatch_async(dispatch_get_main_queue(), ^{
             self.serverRunning = running;
-            [self updateControlStatusText:running ? @"当前状态：运行中" : @"当前状态：未运行"
+            [self updateControlStatusText:running ? [NSString stringWithFormat:@"当前状态：运行中（端口 %u）", (unsigned int)port]
+                                             : [NSString stringWithFormat:@"当前状态：未运行（端口 %u）", (unsigned int)port]
                               buttonTitle:running ? @"关闭 iOS MCP" : @"启动 iOS MCP"
                             buttonEnabled:YES];
         });
@@ -650,6 +771,226 @@ static uint32_t IOSMCPCRC32(NSData *data) {
         [session finishTasksAndInvalidate];
     }];
     [task resume];
+}
+
+- (void)applyPortChangeFromPort:(uint16_t)previousPort toPort:(uint16_t)newPort {
+    if (previousPort == newPort) {
+        [MCPLogger log:@"prefs_port apply skipped unchanged current=%u",
+         (unsigned int)newPort];
+        [self refreshServerStatus];
+        return;
+    }
+
+    [MCPLogger log:@"prefs_port applying running_change previous=%u current=%u",
+     (unsigned int)previousPort,
+     (unsigned int)newPort];
+
+    [self updateControlStatusText:[NSString stringWithFormat:@"当前状态：正在切换到端口 %u...", (unsigned int)newPort]
+                      buttonTitle:@"正在切换..."
+                    buttonEnabled:NO];
+    [self postNotification:IOS_MCP_DARWIN_NOTIFICATION_STOP];
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(500 * NSEC_PER_MSEC)),
+                   dispatch_get_main_queue(), ^{
+        [self postNotification:IOS_MCP_DARWIN_NOTIFICATION_START];
+
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(900 * NSEC_PER_MSEC)),
+                       dispatch_get_main_queue(), ^{
+            [self refreshServerStatus];
+        });
+    });
+}
+
+- (void)configurePortTextField {
+    UITableViewCell *cell = [self portPreferenceCell];
+    UITextField *textField = [self textFieldInView:cell.contentView] ?: [self textFieldInView:cell];
+    if (!textField) {
+        return;
+    }
+
+    textField.keyboardType = UIKeyboardTypeNumbersAndPunctuation;
+    textField.returnKeyType = UIReturnKeyDone;
+    textField.enablesReturnKeyAutomatically = NO;
+    textField.autocorrectionType = UITextAutocorrectionTypeNo;
+    textField.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    if (textField.delegate != self) {
+        self.originalPortTextFieldDelegate = textField.delegate;
+        textField.delegate = self;
+    }
+    [textField removeTarget:self
+                     action:@selector(portTextFieldDidEndOnExit:)
+           forControlEvents:UIControlEventEditingDidEndOnExit];
+    [textField addTarget:self
+                  action:@selector(portTextFieldDidEndOnExit:)
+        forControlEvents:UIControlEventEditingDidEndOnExit];
+    [textField removeTarget:self
+                     action:@selector(portTextFieldDidEndOnExit:)
+           forControlEvents:UIControlEventPrimaryActionTriggered];
+    [textField addTarget:self
+                  action:@selector(portTextFieldDidEndOnExit:)
+        forControlEvents:UIControlEventPrimaryActionTriggered];
+
+    if (textField.isFirstResponder) {
+        [textField reloadInputViews];
+    }
+}
+
+- (void)dismissKeyboardFromTap:(UITapGestureRecognizer *)gestureRecognizer {
+    if (gestureRecognizer.state == UIGestureRecognizerStateEnded) {
+        [self.view endEditing:YES];
+    }
+}
+
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldReceiveTouch:(UITouch *)touch {
+    if (gestureRecognizer != self.keyboardDismissTapGesture) {
+        return YES;
+    }
+
+    UIView *view = touch.view;
+    while (view) {
+        if ([view isKindOfClass:[UITextField class]]) {
+            return NO;
+        }
+        view = view.superview;
+    }
+
+    UITableViewCell *portCell = [self portPreferenceCell];
+    if (portCell) {
+        CGPoint pointInPortCell = [touch locationInView:portCell];
+        if ([portCell pointInside:pointInPortCell withEvent:nil]) {
+            return NO;
+        }
+    }
+
+    view = touch.view;
+    while (view) {
+        if (view == portCell || view == portCell.contentView) {
+            return NO;
+        }
+        view = view.superview;
+    }
+    return YES;
+}
+
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer
+shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherGestureRecognizer {
+    return gestureRecognizer == self.keyboardDismissTapGesture || otherGestureRecognizer == self.keyboardDismissTapGesture;
+}
+
+- (void)installKeyboardDismissGestureIfNeeded {
+    UIView *containerView = self.view;
+    if (!containerView || self.keyboardDismissTapGesture) {
+        return;
+    }
+
+    UITapGestureRecognizer *tapGesture =
+        [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(dismissKeyboardFromTap:)];
+    tapGesture.cancelsTouchesInView = NO;
+    tapGesture.delegate = self;
+    [containerView addGestureRecognizer:tapGesture];
+    self.keyboardDismissTapGesture = tapGesture;
+}
+
+- (BOOL)isPortTextField:(UITextField *)textField {
+    UITableViewCell *cell = [self portPreferenceCell];
+    UITextField *portTextField = [self textFieldInView:cell.contentView] ?: [self textFieldInView:cell];
+    return textField && textField == portTextField;
+}
+
+- (UITableViewCell *)portPreferenceCell {
+    PSSpecifier *portSpecifier = [self specifierForID:@"httpPortField"];
+    if (!portSpecifier) {
+        return nil;
+    }
+
+    UITableViewCell *cell = [self cachedCellForSpecifier:portSpecifier];
+    if (!cell && [self respondsToSelector:@selector(indexPathForSpecifier:)]) {
+        NSIndexPath *indexPath = [self indexPathForSpecifier:portSpecifier];
+        if (indexPath) {
+            cell = [self.table cellForRowAtIndexPath:indexPath];
+        }
+    }
+    return cell;
+}
+
+- (void)portTextFieldDidEndOnExit:(UITextField *)textField {
+    [textField resignFirstResponder];
+    [self.view endEditing:YES];
+}
+
+- (BOOL)textFieldShouldBeginEditing:(UITextField *)textField {
+    id<UITextFieldDelegate> delegate = self.originalPortTextFieldDelegate;
+    if ([self isPortTextField:textField] &&
+        delegate &&
+        delegate != self &&
+        [delegate respondsToSelector:@selector(textFieldShouldBeginEditing:)]) {
+        return [delegate textFieldShouldBeginEditing:textField];
+    }
+    return YES;
+}
+
+- (void)textFieldDidBeginEditing:(UITextField *)textField {
+    id<UITextFieldDelegate> delegate = self.originalPortTextFieldDelegate;
+    if ([self isPortTextField:textField] &&
+        delegate &&
+        delegate != self &&
+        [delegate respondsToSelector:@selector(textFieldDidBeginEditing:)]) {
+        [delegate textFieldDidBeginEditing:textField];
+    }
+}
+
+- (BOOL)textFieldShouldEndEditing:(UITextField *)textField {
+    if ([self isPortTextField:textField]) {
+        return YES;
+    }
+
+    id<UITextFieldDelegate> delegate = self.originalPortTextFieldDelegate;
+    if (delegate &&
+        delegate != self &&
+        [delegate respondsToSelector:@selector(textFieldShouldEndEditing:)]) {
+        return [delegate textFieldShouldEndEditing:textField];
+    }
+    return YES;
+}
+
+- (void)textFieldDidEndEditing:(UITextField *)textField {
+    id<UITextFieldDelegate> delegate = self.originalPortTextFieldDelegate;
+    if ([self isPortTextField:textField] &&
+        delegate &&
+        delegate != self &&
+        [delegate respondsToSelector:@selector(textFieldDidEndEditing:)]) {
+        [delegate textFieldDidEndEditing:textField];
+    }
+}
+
+- (BOOL)textFieldShouldReturn:(UITextField *)textField {
+    if ([self isPortTextField:textField]) {
+        [textField resignFirstResponder];
+        [self.view endEditing:YES];
+        return YES;
+    }
+
+    id<UITextFieldDelegate> delegate = self.originalPortTextFieldDelegate;
+    if (delegate &&
+        delegate != self &&
+        [delegate respondsToSelector:@selector(textFieldShouldReturn:)]) {
+        return [delegate textFieldShouldReturn:textField];
+    }
+    return YES;
+}
+
+- (UITextField *)textFieldInView:(UIView *)view {
+    if ([view isKindOfClass:[UITextField class]]) {
+        return (UITextField *)view;
+    }
+
+    for (UIView *subview in view.subviews) {
+        UITextField *textField = [self textFieldInView:subview];
+        if (textField) {
+            return textField;
+        }
+    }
+    return nil;
 }
 
 - (BOOL)isHealthyServerResponseData:(NSData *)data response:(NSURLResponse *)response error:(NSError *)error {

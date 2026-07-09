@@ -4,11 +4,51 @@
 #import <net/if.h>
 
 #define IOS_MCP_DEFAULT_PORT 8090
+#define IOS_MCP_MIN_PORT 1024
+#define IOS_MCP_MAX_PORT 65535
 #define IOS_MCP_PREFERENCES_DOMAIN @"com.witchan.ios-mcp.preferences"
 #define IOS_MCP_ENABLED_PREFERENCE_KEY @"enabled"
+#define IOS_MCP_PORT_PREFERENCE_KEY @"port"
 #define IOS_MCP_DEBUG_LOGGING_PREFERENCE_KEY @"debugLoggingEnabled"
 #define IOS_MCP_DARWIN_NOTIFICATION_START CFSTR("com.witchan.ios-mcp.control/start")
 #define IOS_MCP_DARWIN_NOTIFICATION_STOP CFSTR("com.witchan.ios-mcp.control/stop")
+
+static inline BOOL IOSMCPParsePortValue(id value, uint16_t *outPort) {
+    long long parsed = 0;
+    BOOL parsedValue = NO;
+
+    if ([value isKindOfClass:[NSNumber class]]) {
+        parsed = [(NSNumber *)value longLongValue];
+        parsedValue = YES;
+    } else if ([value isKindOfClass:[NSString class]]) {
+        NSString *text = [(NSString *)value stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (text.length > 0) {
+            NSScanner *scanner = [NSScanner scannerWithString:text];
+            parsedValue = [scanner scanLongLong:&parsed] && scanner.isAtEnd;
+        }
+    }
+
+    if (!parsedValue || parsed < IOS_MCP_MIN_PORT || parsed > IOS_MCP_MAX_PORT) {
+        return NO;
+    }
+
+    if (outPort) {
+        *outPort = (uint16_t)parsed;
+    }
+    return YES;
+}
+
+static inline uint16_t IOSMCPConfiguredPort(void) {
+    uint16_t port = IOS_MCP_DEFAULT_PORT;
+    CFPreferencesAppSynchronize((__bridge CFStringRef)IOS_MCP_PREFERENCES_DOMAIN);
+    CFPropertyListRef value = CFPreferencesCopyAppValue((__bridge CFStringRef)IOS_MCP_PORT_PREFERENCE_KEY,
+                                                        (__bridge CFStringRef)IOS_MCP_PREFERENCES_DOMAIN);
+    if (value) {
+        IOSMCPParsePortValue((__bridge id)value, &port);
+        CFRelease(value);
+    }
+    return port;
+}
 
 static inline NSString *IOSMCPCurrentLANIPAddress(void) {
     struct ifaddrs *interfaces = NULL;
@@ -47,9 +87,13 @@ static inline NSString *IOSMCPCurrentLANIPAddress(void) {
 }
 
 static inline NSString *IOSMCPServiceURLString(void) {
-    return [NSString stringWithFormat:@"http://%@:%d/mcp", IOSMCPCurrentLANIPAddress(), IOS_MCP_DEFAULT_PORT];
+    return [NSString stringWithFormat:@"http://%@:%u/mcp",
+            IOSMCPCurrentLANIPAddress(),
+            (unsigned int)IOSMCPConfiguredPort()];
 }
 
 static inline NSString *IOSMCPHealthURLString(void) {
-    return [NSString stringWithFormat:@"http://%@:%d/health", IOSMCPCurrentLANIPAddress(), IOS_MCP_DEFAULT_PORT];
+    return [NSString stringWithFormat:@"http://%@:%u/health",
+            IOSMCPCurrentLANIPAddress(),
+            (unsigned int)IOSMCPConfiguredPort()];
 }
