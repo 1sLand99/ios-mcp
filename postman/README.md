@@ -22,7 +22,7 @@ Notes:
 - `upload_file` is a plain HTTP upload endpoint, not an MCP tool call. Its successful response contains only `path`, `filename`, and `size`; the collection test script stores those as `uploaded_file_path`, `uploaded_file_name`, and `uploaded_file_size`.
 - `install_app` expects an IPA or DEB path that already exists on the device. Use `upload_file` first for a computer-local file. DEB installs trigger a SpringBoard restart after dpkg succeeds.
 - `uninstall_app` accepts `bundle_id` for apps or `package_id` for DEB packages. DEB removals trigger a SpringBoard restart after dpkg succeeds.
-- `screenshot` returns MCP image content, not text: `result.content[0].type` is `image`, `mimeType` is usually `image/jpeg`, and `data` contains the base64 JPEG payload.
+- `screenshot` returns MCP image content, not text: `result.content[0].type` is `image`, `mimeType` is `image/jpeg`, and `data` contains the base64 JPEG payload.
 - Some tools are stateful or disruptive, such as `press_power`, `kill_app`, `install_app`, `uninstall_app`, `open_url`, and text input tools.
 - `long_press`, `double_tap`, and `drag_and_drop` call the same HID event path as tap/swipe and may change the foreground app state. `drag_and_drop` can use `points` to drag along a path and release at the last point.
 - If the device IP changes, update `baseUrl` in the environment before testing.

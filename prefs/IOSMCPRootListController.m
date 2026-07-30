@@ -1083,7 +1083,7 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherG
             @"使用注意事项:\n"
             @"1. 开始操作前先用 describe_screen 了解当前屏：一次返回前台 App、可点元素和精确坐标，最省 token，是“看一眼当前屏”的默认入口。它默认不含截图和 OCR，需要时显式开 include_screenshot / include_ocr。\n"
             @"2. 仅在需要细控时才下沉到底层读屏工具：要抓屏外/不可点节点、限制返回量、或排查“AX 为什么抓不到”时，用 get_ui_elements（visible_only / limit / debug）；AX 根本看不到的内容（游戏、Flutter/RN/Unity、Canvas、图片里的字），或只想识别某区域、快扫、指定语种时，用 ocr_screen（region / fast / languages）。\n"
-            @"3. screenshot 最占 token，仅在 AX 和 OCR 都拿不到、或确实需要看图时兜底，不要每步都截。处理结果按 image content 解析（图片 base64 在 result.content[0].data，mimeType 通常 image/jpeg），不要读 result.content[0].text。\n"
+            @"3. screenshot 最占 token，仅在 AX 和 OCR 都拿不到、或确实需要看图时兜底，不要每步都截。处理结果按 image content 解析（图片 base64 在 result.content[0].data，mimeType 固定为 image/jpeg），不要读 result.content[0].text。\n"
             @"4. 以上读屏工具坐标统一为 screen points，OCR/AX 返回的点可直接传给 tap_screen / long_press，无需换算。\n"
             @"5. 如果 get_screen_info 显示 locked=true/screen_on=false，或截图像锁屏，不要继续普通 App 操作；直接调用 wake_and_home 唤醒并回到主屏幕，然后用 get_screen_info/describe_screen（必要时 screenshot）确认（不要用单次 press_home 代替，锁屏下它通常只是唤醒或进入解锁提示）。\n"
             @"6. 服务端启用了锁屏保护；锁屏或熄屏时，点击、滑动、输入、启动 App、Shell 等交互/写入类工具会被拦截，只允许状态查询、截图和 wake_and_home 等恢复工具。\n"

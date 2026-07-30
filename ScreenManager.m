@@ -533,13 +533,9 @@ __attribute__((constructor)) static void _resolveScreenImageFunc(void) {
     UIImage *pointImage = [self pointSizedImageFromImage:image];
     if (!pointImage) return nil;
 
-    NSData *pngData = UIImagePNGRepresentation(pointImage);
-    if (pngData.length > 0 && pngData.length <= kMCPScreenshotTargetBytes) {
-        return [self payloadWithData:pngData mimeType:@"image/png" image:pointImage];
-    }
-
     // Image size is fixed at this point: one pixel == one screen point, so tap coordinates read
-    // off the image need no conversion. Only JPEG quality is traded for bytes; never the size.
+    // off the image need no conversion. Screenshots always use JPEG; only JPEG quality is traded
+    // for bytes, never the size.
     NSData *jpegData = [self JPEGDataForImage:pointImage maxBytes:kMCPScreenshotTargetBytes];
     if (jpegData.length == 0) return nil;
 
