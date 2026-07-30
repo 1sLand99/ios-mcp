@@ -30,7 +30,7 @@
 #define MCP_PROTOCOL_VERSION_LATEST @"2025-11-25"
 #define MCP_PROTOCOL_VERSION_LEGACY @"2025-03-26"
 #define MCP_SERVER_NAME             @"ios-mcp"
-#define MCP_SERVER_VERSION          @"1.2.2"
+#define MCP_SERVER_VERSION          @"1.2.3"
 #define HTTP_BUF_SIZE        (256 * 1024)
 #define MCP_MAX_CHUNK_LINE   (8 * 1024)
 #define MCP_UPLOAD_DIR       @"/var/mobile/Library/Caches/ios-mcp-uploads"
@@ -1587,7 +1587,7 @@ static NSString *MCPLogId(id reqId) {
                     @"httpHeader": @"MCP-Protocol-Version"
                 }
             },
-            @"instructions": @"Use ios-mcp to inspect and operate the connected iPhone.\n\nGetting started: call get_frontmost_app, get_screen_info, get_ui_elements, and screenshot to understand the current device state. get_screen_info includes device_state when SpringBoard exposes it. If locked is true, screen_on is false, the screenshot looks like the Lock Screen, or UI elements are from SpringBoard/Lock Screen, do not continue normal app automation until the device is awake/unlocked.\n\nLock screen handling: a single press_home only wakes or advances the Lock Screen and must not be treated as reaching the Home screen. Use wake_and_home when the device may be locked/off. The equivalent manual sequence is Power then Home when the screen is off, or Home twice when the Lock Screen is already visible. After wake_and_home, verify with screenshot/get_ui_elements/get_frontmost_app before continuing. The server enforces a lock guard: while locked or screen_off, interactive and mutating tools are blocked; only observation and recovery tools are allowed.\n\nTouch and gestures: use screen point coordinates for tap_screen, swipe_screen, long_press, double_tap, and drag_and_drop. drag_and_drop accepts either fromX/fromY/toX/toY for a straight drag, or points for a path where the first point is pressed and the last point is released. For Flutter or custom-rendered apps, accessibility may expose only a container such as FlutterView; use screenshot plus coordinates in that case.\n\nText input: use input_text first for fast bulk text through system keyboard events. If input_text returns isError or reports failure/timeout, immediately retry the same text with type_text; do not repeat input_text. Use type_text for character-by-character input and press_key for special keys (enter, delete, tab, etc.).\n\nHardware buttons: press_home, press_power, press_volume_up, press_volume_down, toggle_mute, wake_and_home.\n\nClipboard: get_clipboard and set_clipboard to read/write clipboard contents.\n\nScreenshot: the screenshot tool returns MCP image content, not text — result.content[0].data contains the base64 JPEG payload and result.content[0].mimeType is usually image/jpeg.\n\nApp management: launch_app, kill_app, list_apps, list_running_apps, get_frontmost_app. launch_app waits until the target app is actually frontmost before returning, so do not immediately re-issue redundant foreground checks unless you need to verify a later transition. To install an IPA or DEB from the computer, first upload raw file bytes to POST /upload_file (for example: curl -H 'X-Filename: app.ipa' --data-binary @app.ipa http://device-ip:<server-port>/upload_file or curl -H 'X-Filename: package.deb' --data-binary @package.deb http://device-ip:<server-port>/upload_file). The upload response returns a device path under /var/mobile/Library/Caches/ios-mcp-uploads; pass that path to install_app. To install an IPA or DEB already on the phone, call install_app directly with its device path. Unsigned or fakesigned IPAs are supported. DEB installs use dpkg and restart SpringBoard after installation succeeds. To uninstall an app, use list_apps to find the bundle_id, then call uninstall_app. To uninstall a DEB package, call uninstall_app with package_id; DEB removal uses dpkg and restarts SpringBoard after success.\n\nDevice control: get_brightness/set_brightness, get_volume/set_volume, open_url (supports http/https and URL schemes like tel://, prefs:root=WIFI, etc.).\n\nDevice info: get_device_info for model, iOS version, battery, storage, memory, and jailbreak type/package information. Pass debug=true only when diagnosing installation integrity to include bundled helper executable status.\n\nHealth checks: avoid shell brace expansion such as for i in {1..30}; ios-mcp commands often run under /bin/sh where that may execute only once. Use seq or a while loop, and use at least --connect-timeout 3 plus --max-time 5 for /health.\n\nShell: run_command to execute shell commands on the device (timeout default 10s, max 30s).\n\nReverse engineering and debugging: get_app_info returns an installed app's bundle path, data container (sandbox) path, App Group container paths, executable path, version, and entitlements — call it first to locate files. list_dir, read_file, and write_file operate on the device filesystem and fall back to the privileged mcp-root helper for protected paths (other apps' sandboxes, system dirs). read_file returns utf8 for text and base64 for binary; it is capped (default 512KB), so for large or binary files use GET /download_file?path=<device-path> to stream the full file (for example: curl 'http://device-ip:<server-port>/download_file?path=/var/mobile/...' -o out.bin). get_syslog captures the live unified system log across all processes (the stream Console.app shows) for a few seconds — it is a live capture, so trigger the activity you want to observe during the window. get_crash_logs lists crash reports (filter by bundle_id), and read_crash_log returns a single report's full text. write_file is blocked while the device is locked or the screen is off."
+            @"instructions": @"Use ios-mcp to inspect and operate the connected iPhone.\n\nGetting started: call get_frontmost_app, get_screen_info, get_ui_elements, and screenshot to understand the current device state. get_screen_info includes device_state when SpringBoard exposes it. If locked is true, screen_on is false, the screenshot looks like the Lock Screen, or UI elements are from SpringBoard/Lock Screen, do not continue normal app automation until the device is awake/unlocked.\n\nLock screen handling: a single press_home only wakes or advances the Lock Screen and must not be treated as reaching the Home screen. Use wake_and_home when the device may be locked/off. The equivalent manual sequence is Power then Home when the screen is off, or Home twice when the Lock Screen is already visible. After wake_and_home, verify with screenshot/get_ui_elements/get_frontmost_app before continuing. The server enforces a lock guard: while locked or screen_off, interactive and mutating tools are blocked; only observation and recovery tools are allowed.\n\nTouch and gestures: use screen point coordinates for tap_screen, swipe_screen, long_press, double_tap, and drag_and_drop. There is a single coordinate space: screenshots are returned at point size (one image pixel = one screen point), and get_ui_elements/tap_element/ocr_screen also report points, so coordinates from any of them are passed to the touch tools unchanged — never divide by the Retina scale. drag_and_drop accepts either fromX/fromY/toX/toY for a straight drag, or points for a path where the first point is pressed and the last point is released. For Flutter or custom-rendered apps, accessibility may expose only a container such as FlutterView; use screenshot plus coordinates in that case.\n\nText input: use input_text first for fast bulk text through system keyboard events. If input_text returns isError or reports failure/timeout, immediately retry the same text with type_text; do not repeat input_text. Use type_text for character-by-character input and press_key for special keys (enter, delete, tab, etc.).\n\nHardware buttons: press_home, press_power, press_volume_up, press_volume_down, toggle_mute, wake_and_home.\n\nClipboard: get_clipboard and set_clipboard to read/write clipboard contents.\n\nScreenshot: the screenshot tool returns MCP image content, not text — result.content[0].data contains the base64 JPEG payload and result.content[0].mimeType is image/jpeg. The image is point-sized, so coordinates measured on it are valid tap_screen coordinates directly.\n\nApp management: launch_app, kill_app, list_apps, list_running_apps, get_frontmost_app. launch_app waits until the target app is actually frontmost before returning, so do not immediately re-issue redundant foreground checks unless you need to verify a later transition. To install an IPA or DEB from the computer, first upload raw file bytes to POST /upload_file (for example: curl -H 'X-Filename: app.ipa' --data-binary @app.ipa http://device-ip:<server-port>/upload_file or curl -H 'X-Filename: package.deb' --data-binary @package.deb http://device-ip:<server-port>/upload_file). The upload response returns a device path under /var/mobile/Library/Caches/ios-mcp-uploads; pass that path to install_app. To install an IPA or DEB already on the phone, call install_app directly with its device path. Unsigned or fakesigned IPAs are supported. DEB installs use dpkg and restart SpringBoard after installation succeeds. To uninstall an app, use list_apps to find the bundle_id, then call uninstall_app. To uninstall a DEB package, call uninstall_app with package_id; DEB removal uses dpkg and restarts SpringBoard after success.\n\nDevice control: get_brightness/set_brightness, get_volume/set_volume, open_url (supports http/https and URL schemes like tel://, prefs:root=WIFI, etc.).\n\nDevice info: get_device_info for model, iOS version, battery, storage, memory, and jailbreak type/package information. Pass debug=true only when diagnosing installation integrity to include bundled helper executable status.\n\nHealth checks: avoid shell brace expansion such as for i in {1..30}; ios-mcp commands often run under /bin/sh where that may execute only once. Use seq or a while loop, and use at least --connect-timeout 3 plus --max-time 5 for /health.\n\nShell: run_command to execute shell commands on the device (timeout default 10s, max 30s).\n\nReverse engineering and debugging: get_app_info returns an installed app's bundle path, data container (sandbox) path, App Group container paths, executable path, version, and entitlements — call it first to locate files. list_dir, read_file, and write_file operate on the device filesystem and fall back to the privileged mcp-root helper for protected paths (other apps' sandboxes, system dirs). read_file returns utf8 for text and base64 for binary; it is capped (default 512KB), so for large or binary files use GET /download_file?path=<device-path> to stream the full file (for example: curl 'http://device-ip:<server-port>/download_file?path=/var/mobile/...' -o out.bin). get_syslog captures the live unified system log across all processes (the stream Console.app shows) for a few seconds — it is a live capture, so trigger the activity you want to observe during the window. get_crash_logs lists crash reports (filter by bundle_id), and read_crash_log returns a single report's full text. write_file is blocked while the device is locked or the screen is off."
         }
     };
 }
@@ -1660,12 +1660,12 @@ static NSString *MCPLogId(id reqId) {
         },
         @{
             @"name": @"tap_screen",
-            @"description": @"Tap the screen at the given point coordinates",
+            @"description": @"Tap the screen at the given point coordinates. Coordinates read off a screenshot are used as-is: screenshots are returned at point size, so no scale conversion is needed.",
             @"inputSchema": @{
                 @"type": @"object",
                 @"properties": @{
-                    @"x": @{@"type": @"number", @"description": @"X coordinate in screen points"},
-                    @"y": @{@"type": @"number", @"description": @"Y coordinate in screen points"}
+                    @"x": @{@"type": @"number", @"description": @"X coordinate in screen points (same space as screenshot pixels and get_ui_elements frames)"},
+                    @"y": @{@"type": @"number", @"description": @"Y coordinate in screen points (same space as screenshot pixels and get_ui_elements frames)"}
                 },
                 @"required": @[@"x", @"y"]
             }
@@ -1716,7 +1716,7 @@ static NSString *MCPLogId(id reqId) {
         },
         @{
             @"name": @"swipe_screen",
-            @"description": @"Swipe from one point to another on screen",
+            @"description": @"Swipe from one point to another on screen. Coordinates are screen points, the same space as screenshot pixels — no scale conversion needed.",
             @"inputSchema": @{
                 @"type": @"object",
                 @"properties": @{
@@ -1737,7 +1737,7 @@ static NSString *MCPLogId(id reqId) {
         },
         @{
             @"name": @"screenshot",
-            @"description": @"Take a screenshot. Returns MCP image content, not text: result.content[0].type is image, mimeType is usually image/jpeg, and data contains the base64 JPEG payload compressed under about 400KB.",
+            @"description": @"Take a screenshot. The image is returned at the screen's point size (one image pixel equals one screen point), so any coordinate read off the image can be passed straight to tap_screen/swipe_screen with no scale conversion — do not divide by the Retina scale. Returns MCP image content, not text: result.content[0].type is image, mimeType is image/jpeg, and data contains the base64 JPEG payload, which targets about 400KB by adjusting quality only, never by resizing.",
             @"inputSchema": @{
                 @"type": @"object",
                 @"properties": @{
@@ -2710,6 +2710,16 @@ static NSString *MCPLogId(id reqId) {
         @"mimeType": mimeType,
         @"source": payload[@"source"] ?: @"unknown"
     } mutableCopy];
+    // Point-sized dimensions, for diagnostics only: the image pixels are already valid tap_screen
+    // coordinates, so no client-side conversion needs these. ImageContent has no width/height
+    // fields, so they go in _meta, which the spec reserves for exactly this.
+    if (payload[@"width"] && payload[@"height"]) {
+        imageContent[@"_meta"] = @{
+            @"width": payload[@"width"],
+            @"height": payload[@"height"],
+            @"coordinate_space": @"points"
+        };
+    }
     NSDictionary *responseContent = [self sanitizeScreenshotContent:imageContent debug:debug];
 
     return @{
@@ -2978,7 +2988,8 @@ static NSString *MCPLogId(id reqId) {
     MCPAddWhitelistedKeys(sanitized, content, @[
         @"type",
         @"data",
-        @"mimeType"
+        @"mimeType",
+        @"_meta"
     ]);
     return [sanitized copy];
 }
@@ -3249,6 +3260,9 @@ static NSString *MCPLogId(id reqId) {
         if ([shot[@"data"] isKindOfClass:[NSString class]]) {
             out[@"screenshot"] = shot[@"data"];
             out[@"screenshot_mime"] = shot[@"mimeType"] ?: @"image/jpeg";
+            if (shot[@"width"]) out[@"screenshot_width"] = shot[@"width"];
+            if (shot[@"height"]) out[@"screenshot_height"] = shot[@"height"];
+            out[@"screenshot_coordinate_space"] = @"points";
         }
     }
 

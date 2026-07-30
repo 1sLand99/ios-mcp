@@ -72,23 +72,16 @@ http://设备IP:8090/health
 3. 返回以下内容表示服务启动正常：
 
 ```json
-{"status":"ok","server":"ios-mcp","version":"1.2.2","protocolVersion":"2025-11-25","supportedProtocolVersions":["2025-11-25","2025-06-18","2025-03-26"]}
+{"status":"ok","server":"ios-mcp","version":"1.2.3","protocolVersion":"2025-11-25","supportedProtocolVersions":["2025-11-25","2025-06-18","2025-03-26"]}
 ```
 
 ## 使用
 
-安装后打开设备「设置」→「iOS MCP」，启动服务后点击「复制 MCP 提示词片段」，将其粘贴到你的 AI 提示词中即可。
+安装后打开设备「设置」→「iOS MCP」，启动服务后点击「复制并分享 MCP 提示词片段」，将其粘贴到你的 AI 提示词中即可。
 
 <p align="center">
   <img src="screenshots/settings.jpeg" alt="iOS MCP 设置" width="300">
 </p>
-
-下载设备上的大文件或二进制文件时，可直接访问 HTTP 端点，避免 base64 截断：
-
-```bash
-curl 'http://设备IP:8090/download_file?path=/var/mobile/...' -o output.bin
-```
-
 
 ## 安全说明
 
@@ -104,12 +97,12 @@ curl 'http://设备IP:8090/download_file?path=/var/mobile/...' -o output.bin
 
 `iOS MCP` 已经聚集了不少开发者和用户持续交流，目前已建立多个微信交流群。
 
-| 微信交流群（6群开放中） | 公众号 |
+| 微信交流群（8群开放中） | 公众号 |
 |---|---|
-| 1群：已满<br>2群：已满<br>3群：已满<br>4群：已满<br>5群：已满<br>6群：已满<br>7群：开放中 | `移动端Android和iOS开发技术分享` |
-| <img src="https://raw.githubusercontent.com/witchan/Imgur/main/group6_qr.JPG" alt="iOS MCP 微信 6 群二维码" width="260"> | <img src="prefs/Resources/wechat_qr.jpg" alt="移动端Android和iOS开发技术分享 公众号二维码" width="220"> |
+| 1群：已满<br>2群：已满<br>3群：已满<br>4群：已满<br>5群：已满<br>6群：已满<br>7群：已满<br>8群：开放中 | `小陈iOS逆向与安全` |
+| <img src="https://raw.githubusercontent.com/witchan/Imgur/main/group6_qr.JPG" alt="iOS MCP 微信 8 群二维码" width="260"> | <img src="prefs/Resources/wechat_qr.jpg" alt="移动端Android和iOS开发技术分享 公众号二维码" width="220"> |
 
-> 7群二维码如已过期，请添加微信 `witchan028` 或关注公众号 `移动端Android和iOS开发技术分享` 获取最新入群方式。
+> 8群二维码如已过期，请添加微信 `witchan028` 或关注公众号 `小陈iOS逆向与安全` 获取最新入群方式。
 
 欢迎添加微信或关注公众号，获取最新动态与入群方式。
 

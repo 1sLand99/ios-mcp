@@ -22,11 +22,31 @@ static double OCRNum(NSDictionary *d, NSString *k) {
     return [v respondsToSelector:@selector(doubleValue)] ? [v doubleValue] : 0.0;
 }
 
+/// Screen size in points, with long/short edges oriented to match `image`.
+///
+/// UIScreen.bounds follows the current interface orientation, while a framebuffer capture may not,
+/// so the edges are assigned by comparing aspect. Returns CGSizeZero if the screen size is unknown.
+static CGSize OCRPointSizeMatchingImage(UIImage *image) {
+    CGSize screenSize = [UIScreen mainScreen].bounds.size;
+    CGFloat pointLong = MAX(screenSize.width, screenSize.height);
+    CGFloat pointShort = MIN(screenSize.width, screenSize.height);
+    if (pointLong < 1.0 || pointShort < 1.0) return CGSizeZero;
+
+    CGImageRef cgImage = image.CGImage;
+    CGFloat imageWidth = cgImage ? (CGFloat)CGImageGetWidth(cgImage) : image.size.width;
+    CGFloat imageHeight = cgImage ? (CGFloat)CGImageGetHeight(cgImage) : image.size.height;
+    if (imageWidth < 1.0 || imageHeight < 1.0) return CGSizeZero;
+
+    BOOL imageIsLandscape = imageWidth > imageHeight;
+    return imageIsLandscape ? CGSizeMake(pointLong, pointShort)
+                            : CGSizeMake(pointShort, pointLong);
+}
+
 // Downsample a CGImage so its longest edge is at most maxEdge pixels, via CoreGraphics.
 // Vision text recognition does not need full-resolution input; shrinking a large iPad
 // capture (e.g. 1620x2160) cuts recognition time several fold. Returns NULL if no
-// downsample is needed or on failure (caller then keeps the original). Coordinate mapping
-// is unaffected: results are mapped back using the logical UIImage.size, not pixel size.
+// downsample is needed or on failure (caller then keeps the original). Coordinate mapping is
+// unaffected: Vision reports normalized boxes, which are mapped back onto the screen point size.
 static CGImageRef OCRCreateDownsampled(CGImageRef src, CGFloat maxEdge) CF_RETURNS_RETAINED {
     if (!src) return NULL;
     size_t w = CGImageGetWidth(src);
@@ -65,10 +85,21 @@ static CGImageRef OCRCreateDownsampled(CGImageRef src, CGFloat maxEdge) CF_RETUR
             return nil;
         }
 
-        // UIImage.size is in points and matches the screen's logical size; OCR results are
-        // mapped back to these points so the returned rect/tap are tap_screen-ready.
-        CGFloat W = image.size.width;
-        CGFloat H = image.size.height;
+        // Recognition runs on the full-resolution capture (small text needs the pixels), but every
+        // rect/tap is reported in screen points so it is tap_screen-ready.
+        //
+        // image.size is deliberately not used here: it is pixelSize / image.scale, and the capture
+        // paths tag images with UIScreen.scale. Under Display Zoom the framebuffer is rendered at
+        // nativeScale instead, so that division does not land on the point size. Deriving the size
+        // from UIScreen.bounds is exact by definition. Long/short edges are matched because the
+        // capture does not necessarily share bounds' orientation.
+        CGSize pointSize = OCRPointSizeMatchingImage(image);
+        CGFloat W = pointSize.width;
+        CGFloat H = pointSize.height;
+        if (W < 1.0 || H < 1.0) {
+            if (error) *error = @"Failed to determine screen point size for OCR";
+            return nil;
+        }
 
         __block NSArray<VNRecognizedTextObservation *> *observations = nil;
         __block NSError *visionError = nil;
@@ -86,15 +117,26 @@ static CGImageRef OCRCreateDownsampled(CGImageRef src, CGFloat maxEdge) CF_RETUR
         }
 
         // Limit OCR to a region of interest if provided (Vision uses normalized, origin bottom-left).
-        if ([region isKindOfClass:[NSDictionary class]] && region.count > 0 && W > 0 && H > 0) {
+        // The ROI is kept so observation boxes, which Vision normalizes against the ROI rather than
+        // the full image, can be mapped back to full-image space below.
+        CGRect roi = CGRectMake(0, 0, 1, 1);
+        if ([region isKindOfClass:[NSDictionary class]] && region.count > 0) {
             double rx = OCRNum(region, @"x"), ry = OCRNum(region, @"y");
             double rw = OCRNum(region, @"width"), rh = OCRNum(region, @"height");
             if (rw > 0 && rh > 0) {
-                double nx = rx / W;
-                double nw = rw / W;
-                double nh = rh / H;
-                double ny = 1.0 - (ry + rh) / H; // flip Y
-                request.regionOfInterest = CGRectMake(MAX(0, nx), MAX(0, ny), MIN(1, nw), MIN(1, nh));
+                // Clamp in point space first, so the normalized rect cannot extend past the edges
+                // (origin + size > 1 leaves Vision's behaviour and the reverse mapping undefined).
+                double left = MAX(0.0, MIN(rx, W));
+                double top = MAX(0.0, MIN(ry, H));
+                double right = MAX(left, MIN(rx + rw, W));
+                double bottom = MAX(top, MIN(ry + rh, H));
+                if (right > left && bottom > top) {
+                    roi = CGRectMake(left / W,
+                                     (H - bottom) / H,  // flip Y to bottom-left origin
+                                     (right - left) / W,
+                                     (bottom - top) / H);
+                    request.regionOfInterest = roi;
+                }
             }
         }
 
@@ -146,12 +188,19 @@ static CGImageRef OCRCreateDownsampled(CGImageRef src, CGFloat maxEdge) CF_RETUR
             NSString *str = top.string ?: @"";
             if (str.length == 0) continue;
 
-            // boundingBox is normalized (0..1), origin bottom-left. Map to screen points.
+            // boundingBox is normalized (0..1), origin bottom-left, and relative to the ROI rather
+            // than the whole image. Compose it back into full-image space before scaling to points;
+            // roi is the full unit rect when no region was requested, making this a no-op then.
             CGRect bb = obs.boundingBox;
-            double x = bb.origin.x * W;
-            double w = bb.size.width * W;
-            double h = bb.size.height * H;
-            double y = (1.0 - bb.origin.y - bb.size.height) * H; // flip Y to top-left origin
+            double fx = roi.origin.x + bb.origin.x * roi.size.width;
+            double fy = roi.origin.y + bb.origin.y * roi.size.height;
+            double fw = bb.size.width * roi.size.width;
+            double fh = bb.size.height * roi.size.height;
+
+            double x = fx * W;
+            double w = fw * W;
+            double h = fh * H;
+            double y = (1.0 - fy - fh) * H; // flip Y to top-left origin
 
             int ix = (int)round(x), iy = (int)round(y);
             int iw = (int)round(w), ih = (int)round(h);

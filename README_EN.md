@@ -72,22 +72,16 @@ http://DEVICE_IP:8090/health
 3. If you get the following response, the service is running correctly:
 
 ```json
-{"status":"ok","server":"ios-mcp","version":"1.2.2","protocolVersion":"2025-11-25","supportedProtocolVersions":["2025-11-25","2025-06-18","2025-03-26"]}
+{"status":"ok","server":"ios-mcp","version":"1.2.3","protocolVersion":"2025-11-25","supportedProtocolVersions":["2025-11-25","2025-06-18","2025-03-26"]}
 ```
 
 ## Usage
 
-After installation, open **Settings** → **iOS MCP** on your device. Start the server, then tap "Copy MCP Prompt Snippet" and paste it into your AI agent's prompt.
+After installation, open **Settings** → **iOS MCP** on your device. Start the server, then tap "复制并分享 MCP 提示词片段" ("Copy and Share MCP Prompt Snippet") and paste it into your AI agent's prompt.
 
 <p align="center">
   <img src="screenshots/settings.jpeg" alt="iOS MCP Settings" width="300">
 </p>
-
-To download large or binary files from the device, access the HTTP endpoint directly to avoid base64 truncation:
-
-```bash
-curl 'http://device-ip:8090/download_file?path=/var/mobile/...' -o output.bin
-```
 
 ## Security Notes
 
@@ -103,12 +97,12 @@ curl 'http://device-ip:8090/download_file?path=/var/mobile/...' -o output.bin
 
 `iOS MCP` already has an active community of developers and users, with multiple WeChat groups available for discussion.
 
-| WeChat Groups (Group 6 Open) | Official Account |
+| WeChat Groups (Group 8 Open) | Official Account |
 |---|---|
-| Group 1: Full<br>Group 2: Full<br>Group 3: Full<br>Group 4: Full<br>Group 5: Full<br>Group 6: Open | `移动端Android和iOS开发技术分享` |
-| <img src="https://raw.githubusercontent.com/witchan/Imgur/main/group6_qr.JPG" alt="iOS MCP WeChat Group 6 QR Code" width="260"> | <img src="prefs/Resources/wechat_qr.jpg" alt="WeChat Official Account QR Code" width="220"> |
+| Group 1: Full<br>Group 2: Full<br>Group 3: Full<br>Group 4: Full<br>Group 5: Full<br>Group 6: Full<br>Group 7: Full<br>Group 8: Open | `小陈iOS逆向与安全` |
+| <img src="https://raw.githubusercontent.com/witchan/Imgur/main/group6_qr.JPG" alt="iOS MCP WeChat Group 8 QR Code" width="260"> | <img src="prefs/Resources/wechat_qr.jpg" alt="WeChat Official Account QR Code" width="220"> |
 
-> If the Group 6 QR code has expired, add WeChat `witchan028` or follow the official account `移动端Android和iOS开发技术分享` to get the latest group invite.
+> If the Group 8 QR code has expired, add WeChat `witchan028` or follow the official account `小陈iOS逆向与安全` to get the latest group invite.
 
 Feel free to add me on WeChat or follow the official account for updates and the latest group access information.
 

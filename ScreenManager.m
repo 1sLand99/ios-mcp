@@ -24,9 +24,31 @@ static CARenderServerCaptureDisplayFunc _CARenderServerCaptureDisplayFunc = NULL
 
 static const NSUInteger kMCPScreenshotTargetBytes = 400 * 1024;
 static const CGFloat kMCPScreenshotInitialJPEGQuality = 0.82;
-static const CGFloat kMCPScreenshotMinimumJPEGQuality = 0.45;
+static const CGFloat kMCPScreenshotMinimumJPEGQuality = 0.30;
 static const NSInteger kMCPScreenshotJPEGSearchPasses = 6;
-static const NSInteger kMCPScreenshotResizePasses = 4;
+
+/// Point-space target size for a pixel-space capture of `pixelSize`.
+///
+/// Screenshots are downsampled so that one image pixel equals one screen point, which makes the
+/// coordinates an agent reads off the image directly usable with tap_screen/swipe_screen. The
+/// ratio is measured from the capture itself rather than taken from UIScreen.scale: under Display
+/// Zoom the framebuffer is rendered at nativeScale (which differs from scale), and captures do not
+/// necessarily share UIScreen.bounds' orientation. Long/short edges are matched for the same
+/// reason. Returns CGSizeZero when no downsample is needed or the screen size is unknown.
+static CGSize MCPPointSizeForPixelSize(CGSize pixelSize) {
+    if (pixelSize.width < 1.0 || pixelSize.height < 1.0) return CGSizeZero;
+
+    CGSize screenSize = [UIScreen mainScreen].bounds.size;
+    CGFloat pointLongEdge = MAX(screenSize.width, screenSize.height);
+    if (pointLongEdge < 1.0) return CGSizeZero;
+
+    CGFloat pixelLongEdge = MAX(pixelSize.width, pixelSize.height);
+    CGFloat ratio = pixelLongEdge / pointLongEdge;
+    if (ratio <= 1.01) return CGSizeZero;  // already point-sized (or smaller)
+
+    return CGSizeMake(MAX(round(pixelSize.width / ratio), 1.0),
+                      MAX(round(pixelSize.height / ratio), 1.0));
+}
 
 static id MCPObjectFromClassSelector(const char *className, SEL selector) {
     Class cls = objc_getClass(className);
@@ -93,6 +115,8 @@ __attribute__((constructor)) static void _resolveScreenImageFunc(void) {
         UIScreen *screen = [UIScreen mainScreen];
         CGRect bounds = screen.bounds;
         CGFloat scale = screen.scale;
+        // nativeScale differs from scale under Display Zoom; the framebuffer follows nativeScale.
+        CGFloat pixelScale = screen.nativeScale > 0 ? screen.nativeScale : scale;
 
         NSString *orientationStr;
         UIInterfaceOrientation orientation;
@@ -122,9 +146,15 @@ __attribute__((constructor)) static void _resolveScreenImageFunc(void) {
             @"width":       @(bounds.size.width),
             @"height":      @(bounds.size.height),
             @"scale":       @(scale),
-            @"pixel_width": @(bounds.size.width * scale),
-            @"pixel_height":@(bounds.size.height * scale),
+            @"native_scale":@(pixelScale),
+            @"pixel_width": @(round(bounds.size.width * pixelScale)),
+            @"pixel_height":@(round(bounds.size.height * pixelScale)),
             @"orientation": orientationStr,
+            @"coordinate_space_hint": @"width/height are screen points — the coordinate space used by "
+                                      @"tap_screen, swipe_screen, long_press, double_tap and drag_and_drop. "
+                                      @"The screenshot tool already returns point-sized images, so "
+                                      @"coordinates read off a screenshot are used directly, without "
+                                      @"dividing by scale.",
         } mutableCopy];
 
         if (interactionState.count > 0) {
@@ -332,23 +362,14 @@ __attribute__((constructor)) static void _resolveScreenImageFunc(void) {
         return nil;
     }
 
-    NSData *fileData = UIImagePNGRepresentation(screenImage);
-    UIImage *image = fileData.length > 0 ? [UIImage imageWithData:fileData] : screenImage;
-    return UIImageJPEGRepresentation(image, quality);
+    return UIImageJPEGRepresentation(screenImage, quality);
 }
 
 - (NSDictionary *)payloadByEncodingImageData:(NSData *)imageData source:(NSString *)source {
     if (imageData.length == 0) return nil;
 
-    if (imageData.length <= kMCPScreenshotTargetBytes) {
-        SCREEN_LOG(@"Screenshot captured via %@", source ?: @"unknown");
-        return @{
-            @"data": [imageData base64EncodedStringWithOptions:0],
-            @"mimeType": @"image/jpeg",
-            @"source": source ?: @"unknown"
-        };
-    }
-
+    // Captures arrive at native pixel resolution, so the bytes are always re-encoded through
+    // encodedPayloadForImage to reach point size. There is no pass-through fast path.
     UIImage *image = [UIImage imageWithData:imageData];
     return [self payloadByEncodingImage:image source:source];
 }
@@ -509,44 +530,62 @@ __attribute__((constructor)) static void _resolveScreenImageFunc(void) {
 }
 
 - (NSDictionary *)encodedPayloadForImage:(UIImage *)image {
+    UIImage *pointImage = [self pointSizedImageFromImage:image];
+    if (!pointImage) return nil;
+
+    // Image size is fixed at this point: one pixel == one screen point, so tap coordinates read
+    // off the image need no conversion. Screenshots always use JPEG; only JPEG quality is traded
+    // for bytes, never the size.
+    NSData *jpegData = [self JPEGDataForImage:pointImage maxBytes:kMCPScreenshotTargetBytes];
+    if (jpegData.length == 0) return nil;
+
+    if (jpegData.length > kMCPScreenshotTargetBytes) {
+        SCREEN_LOG(@"Screenshot still %.0fKB at minimum JPEG quality; returning it at full point size "
+                   @"rather than resizing (resizing would break image-pixel == screen-point)",
+                   jpegData.length / 1024.0);
+    }
+    return [self payloadWithData:jpegData mimeType:@"image/jpeg" image:pointImage];
+}
+
+- (NSDictionary *)payloadWithData:(NSData *)data mimeType:(NSString *)mimeType image:(UIImage *)image {
+    CGSize size = [self pixelSizeForImage:image];
+    return @{
+        @"data": [data base64EncodedStringWithOptions:0],
+        @"mimeType": mimeType,
+        @"width": @((NSInteger)round(size.width)),
+        @"height": @((NSInteger)round(size.height))
+    };
+}
+
+- (CGSize)pixelSizeForImage:(UIImage *)image {
+    CGImageRef cgImage = image.CGImage;
+    if (cgImage) {
+        return CGSizeMake((CGFloat)CGImageGetWidth(cgImage), (CGFloat)CGImageGetHeight(cgImage));
+    }
+    CGFloat scale = image.scale > 0 ? image.scale : 1.0;
+    return CGSizeMake(image.size.width * scale, image.size.height * scale);
+}
+
+/// Redraw `image` so its pixel dimensions equal the screen's point dimensions.
+- (UIImage *)pointSizedImageFromImage:(UIImage *)image {
     if (!image) return nil;
 
-    NSData *pngData = UIImagePNGRepresentation(image);
-    if (pngData.length > 0 && pngData.length <= kMCPScreenshotTargetBytes) {
-        return @{
-            @"data": [pngData base64EncodedStringWithOptions:0],
-            @"mimeType": @"image/png"
-        };
-    }
+    CGSize pixelSize = [self pixelSizeForImage:image];
+    CGSize targetSize = MCPPointSizeForPixelSize(pixelSize);
+    if (CGSizeEqualToSize(targetSize, CGSizeZero)) return image;
 
-    UIImage *workingImage = image;
-    NSData *bestJPEGData = nil;
+    UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat defaultFormat];
+    format.scale = 1.0;
+    format.opaque = YES;
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:targetSize format:format];
+    UIImage *pointImage = [renderer imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+        [image drawInRect:CGRectMake(0, 0, targetSize.width, targetSize.height)];
+    }];
+    if (!pointImage) return image;
 
-    for (NSInteger attempt = 0; attempt < kMCPScreenshotResizePasses; attempt++) {
-        NSData *jpegData = [self JPEGDataForImage:workingImage maxBytes:kMCPScreenshotTargetBytes];
-        if (!jpegData) break;
-
-        bestJPEGData = jpegData;
-        if (jpegData.length <= kMCPScreenshotTargetBytes) {
-            return @{
-                @"data": [jpegData base64EncodedStringWithOptions:0],
-                @"mimeType": @"image/jpeg"
-            };
-        }
-
-        UIImage *scaledImage = [self resizedImage:workingImage toFitBytes:jpegData.length];
-        if (!scaledImage) break;
-        workingImage = scaledImage;
-    }
-
-    if (bestJPEGData.length > 0) {
-        return @{
-            @"data": [bestJPEGData base64EncodedStringWithOptions:0],
-            @"mimeType": @"image/jpeg"
-        };
-    }
-
-    return nil;
+    SCREEN_LOG(@"Downsampled screenshot %.0fx%.0f px -> %.0fx%.0f pt",
+               pixelSize.width, pixelSize.height, targetSize.width, targetSize.height);
+    return pointImage;
 }
 
 - (NSData *)JPEGDataForImage:(UIImage *)image maxBytes:(NSUInteger)maxBytes {
@@ -557,6 +596,10 @@ __attribute__((constructor)) static void _resolveScreenImageFunc(void) {
     NSData *minimumData = UIImageJPEGRepresentation(image, kMCPScreenshotMinimumJPEGQuality);
     if (!minimumData) return bestData;
     if (minimumData.length > maxBytes) return minimumData;
+
+    // minimumData is known to fit, so it becomes the fallback: if every probe below overshoots,
+    // returning the (oversized) initial encode instead would be strictly worse.
+    bestData = minimumData;
 
     CGFloat low = kMCPScreenshotMinimumJPEGQuality;
     CGFloat high = kMCPScreenshotInitialJPEGQuality;
@@ -574,30 +617,6 @@ __attribute__((constructor)) static void _resolveScreenImageFunc(void) {
     }
 
     return bestData;
-}
-
-- (UIImage *)resizedImage:(UIImage *)image toFitBytes:(NSUInteger)currentBytes {
-    CGImageRef cgImage = image.CGImage;
-    if (!cgImage || currentBytes == 0) return nil;
-
-    CGFloat ratio = sqrt((double)kMCPScreenshotTargetBytes / (double)currentBytes) * 0.98;
-    ratio = MIN(ratio, 0.9);
-    ratio = MAX(ratio, 0.55);
-
-    size_t width = CGImageGetWidth(cgImage);
-    size_t height = CGImageGetHeight(cgImage);
-    CGSize targetSize = CGSizeMake(MAX((CGFloat)floor(width * ratio), 1.0),
-                                   MAX((CGFloat)floor(height * ratio), 1.0));
-    if (targetSize.width >= width || targetSize.height >= height) {
-        return nil;
-    }
-
-    UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat defaultFormat];
-    format.scale = 1.0;
-    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:targetSize format:format];
-    return [renderer imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
-        [image drawInRect:CGRectMake(0, 0, targetSize.width, targetSize.height)];
-    }];
 }
 
 @end
