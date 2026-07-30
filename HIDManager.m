@@ -16,6 +16,9 @@
 static uint64_t _touchSenderID = 0x8000000817319372;
 static double _deviceScreenWidth = 0;
 static double _deviceScreenHeight = 0;
+// Keep a tap down long enough for UIKit controls such as UISwitch to observe it as a real touch.
+// Dispatching began/moved/ended back-to-back can be coalesced before the control processes it.
+static const useconds_t kIOSMCPTapPhaseDelayUs = 50 * 1000;
 
 #define MAX_FINGER_INDEX 20
 #define TOUCH_EVENT_NOT_VALID 0
@@ -289,13 +292,25 @@ static void appendChildTouchEvent(IOHIDEventRef parent, TouchPhase phase, int in
 
 #pragma mark - Tap
 
+- (BOOL)performTapSequenceAtPoint:(CGPoint)point error:(NSString **)error {
+    if (![self performTouchAtPoint:point phase:TouchPhaseBegan error:error]) {
+        return NO;
+    }
+    usleep(kIOSMCPTapPhaseDelayUs);
+
+    if (![self performTouchAtPoint:point phase:TouchPhaseMoved error:error]) {
+        return NO;
+    }
+    usleep(kIOSMCPTapPhaseDelayUs);
+
+    return [self performTouchAtPoint:point phase:TouchPhaseEnded error:error];
+}
+
 - (void)tapAtPoint:(CGPoint)point completion:(void (^)(BOOL, NSString *))completion {
     dispatch_async(_hidQueue, ^{
         @try {
             NSString *error = nil;
-            if (![self performTouchAtPoint:point phase:TouchPhaseBegan error:&error] ||
-                ![self performTouchAtPoint:point phase:TouchPhaseMoved error:&error] ||
-                ![self performTouchAtPoint:point phase:TouchPhaseEnded error:&error]) {
+            if (![self performTapSequenceAtPoint:point error:&error]) {
                 if (completion) completion(NO, error);
                 return;
             }
@@ -381,18 +396,14 @@ static void appendChildTouchEvent(IOHIDEventRef parent, TouchPhase phase, int in
             NSString *error = nil;
             NSTimeInterval interval = intervalMs > 0 ? intervalMs : 100;
 
-            if (![self performTouchAtPoint:point phase:TouchPhaseBegan error:&error] ||
-                ![self performTouchAtPoint:point phase:TouchPhaseMoved error:&error] ||
-                ![self performTouchAtPoint:point phase:TouchPhaseEnded error:&error]) {
+            if (![self performTapSequenceAtPoint:point error:&error]) {
                 if (completion) completion(NO, error);
                 return;
             }
 
             usleep((useconds_t)(interval * 1000));
 
-            if (![self performTouchAtPoint:point phase:TouchPhaseBegan error:&error] ||
-                ![self performTouchAtPoint:point phase:TouchPhaseMoved error:&error] ||
-                ![self performTouchAtPoint:point phase:TouchPhaseEnded error:&error]) {
+            if (![self performTapSequenceAtPoint:point error:&error]) {
                 if (completion) completion(NO, error);
                 return;
             }
