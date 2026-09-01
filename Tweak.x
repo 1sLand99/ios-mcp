@@ -52,7 +52,9 @@ static BOOL ios_mcp_is_springboard_process(void) {
 
 static uint16_t ios_mcp_start_server(void) {
     uint16_t port = IOSMCPConfiguredPort();
-    [[MCPServer sharedInstance] startOnPort:port];
+    // A Settings START is also the recovery path when the listener still
+    // exists but its HTTP workers are wedged. Force a serialized restart.
+    [[MCPServer sharedInstance] restartOnPort:port];
     return port;
 }
 
@@ -93,15 +95,15 @@ static void ios_mcp_autostart_if_needed(NSString *reason) {
         return;
     }
 
+    uint16_t port = IOSMCPConfiguredPort();
     MCPServer *server = [MCPServer sharedInstance];
-    if (server.isRunning) {
+    if (server.isRunning && server.port == port) {
         IOS_MCP_LOG(@"Auto-start skipped (%@): already running on port %d",
                     reason ?: @"unknown",
                     server.port);
         return;
     }
 
-    uint16_t port = IOSMCPConfiguredPort();
     IOS_MCP_LOG(@"Auto-start attempt (%@) on port %u...",
                 reason ?: @"unknown",
                 (unsigned int)port);

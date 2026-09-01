@@ -10,6 +10,7 @@
 @interface IOSMCPRootListController () <UIGestureRecognizerDelegate, UITextFieldDelegate>
 
 @property (nonatomic, assign) BOOL serverRunning;
+@property (nonatomic, assign) NSUInteger serverStatusGeneration;
 @property (nonatomic, strong) UITapGestureRecognizer *keyboardDismissTapGesture;
 @property (nonatomic, weak) id<UITextFieldDelegate> originalPortTextFieldDelegate;
 
@@ -69,6 +70,25 @@ static NSString *IOSMCPKillallPath(void) {
         }
     }
     return nil;
+}
+
+static BOOL IOSMCPEnabledPreference(void) {
+    CFPreferencesAppSynchronize((__bridge CFStringRef)IOS_MCP_PREFERENCES_DOMAIN);
+    CFPropertyListRef value = CFPreferencesCopyAppValue((__bridge CFStringRef)IOS_MCP_ENABLED_PREFERENCE_KEY,
+                                                        (__bridge CFStringRef)IOS_MCP_PREFERENCES_DOMAIN);
+    if (!value) return YES;
+
+    BOOL enabled = YES;
+    CFTypeID typeID = CFGetTypeID(value);
+    if (typeID == CFBooleanGetTypeID()) {
+        enabled = CFBooleanGetValue((CFBooleanRef)value);
+    } else if (typeID == CFNumberGetTypeID()) {
+        int numericValue = 0;
+        CFNumberGetValue((CFNumberRef)value, kCFNumberIntType, &numericValue);
+        enabled = numericValue != 0;
+    }
+    CFRelease(value);
+    return enabled;
 }
 
 @implementation IOSMCPRootListController
@@ -163,7 +183,7 @@ static NSString *IOSMCPKillallPath(void) {
                                   IOS_MCP_DEFAULT_PORT]];
     }
 
-    if (previousPort != newPort && self.serverRunning) {
+    if (previousPort != newPort && IOSMCPEnabledPreference()) {
         [self applyPortChangeFromPort:previousPort toPort:newPort];
     } else {
         [self refreshServerStatus];
@@ -179,11 +199,15 @@ static NSString *IOSMCPKillallPath(void) {
                       buttonTitle:shouldStart ? @"正在启动..." : @"正在关闭..."
                     buttonEnabled:NO];
 
-    [self showAlertWithTitle:shouldStart ? @"iOS MCP 已启动" : @"iOS MCP 已关闭"
-                     message:shouldStart ? [NSString stringWithFormat:@"服务已经在端口 %u 启动，并会在下次 SpringBoard 启动后自动开启。", (unsigned int)port]
-                                        : @"服务已经停止，并会保持关闭状态，直到你再次手动启动。"];
+    [self showAlertWithTitle:shouldStart ? @"正在启动 iOS MCP" : @"正在关闭 iOS MCP"
+                     message:shouldStart ? [NSString stringWithFormat:@"已发送端口 %u 的启动请求，设置页会在服务响应后更新状态。", (unsigned int)port]
+                                        : @"已发送关闭请求，设置页会在服务停止后更新状态。"];
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(800 * NSEC_PER_MSEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1000 * NSEC_PER_MSEC)),
+                   dispatch_get_main_queue(), ^{
+        [self refreshServerStatus];
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3000 * NSEC_PER_MSEC)),
                    dispatch_get_main_queue(), ^{
         [self refreshServerStatus];
     });
@@ -735,6 +759,7 @@ static NSString *IOSMCPKillallPath(void) {
 }
 
 - (void)refreshServerStatus {
+    NSUInteger generation = ++self.serverStatusGeneration;
     [self updateControlStatusText:@"当前状态：检测中..."
                       buttonTitle:@"检测中..."
                     buttonEnabled:NO];
@@ -742,12 +767,12 @@ static NSString *IOSMCPKillallPath(void) {
     uint16_t port = IOSMCPConfiguredPort();
     NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"http://127.0.0.1:%u/health", (unsigned int)port]];
     NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
-    request.timeoutInterval = 1.0;
+    request.timeoutInterval = 5.0;
     request.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
 
     NSURLSessionConfiguration *configuration = [NSURLSessionConfiguration ephemeralSessionConfiguration];
-    configuration.timeoutIntervalForRequest = 1.0;
-    configuration.timeoutIntervalForResource = 1.0;
+    configuration.timeoutIntervalForRequest = 5.0;
+    configuration.timeoutIntervalForResource = 6.0;
 
     __weak typeof(self) weakSelf = self;
     NSURLSession *session = [NSURLSession sessionWithConfiguration:configuration];
@@ -761,9 +786,15 @@ static NSString *IOSMCPKillallPath(void) {
 
         BOOL running = [self isHealthyServerResponseData:data response:response error:error];
         dispatch_async(dispatch_get_main_queue(), ^{
+            if (generation != self.serverStatusGeneration || port != IOSMCPConfiguredPort()) {
+                return;
+            }
             self.serverRunning = running;
+            NSString *stoppedText = (error.code == NSURLErrorTimedOut)
+                ? [NSString stringWithFormat:@"当前状态：端口 %u 无响应", (unsigned int)port]
+                : [NSString stringWithFormat:@"当前状态：未运行（端口 %u）", (unsigned int)port];
             [self updateControlStatusText:running ? [NSString stringWithFormat:@"当前状态：运行中（端口 %u）", (unsigned int)port]
-                                             : [NSString stringWithFormat:@"当前状态：未运行（端口 %u）", (unsigned int)port]
+                                             : stoppedText
                               buttonTitle:running ? @"关闭 iOS MCP" : @"启动 iOS MCP"
                             buttonEnabled:YES];
         });
@@ -788,16 +819,13 @@ static NSString *IOSMCPKillallPath(void) {
     [self updateControlStatusText:[NSString stringWithFormat:@"当前状态：正在切换到端口 %u...", (unsigned int)newPort]
                       buttonTitle:@"正在切换..."
                     buttonEnabled:NO];
-    [self postNotification:IOS_MCP_DARWIN_NOTIFICATION_STOP];
+    // START is handled as a serialized restart in SpringBoard. Do not guess
+    // when an asynchronous dispatch-source cancellation has closed the old fd.
+    [self postNotification:IOS_MCP_DARWIN_NOTIFICATION_START];
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(500 * NSEC_PER_MSEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1000 * NSEC_PER_MSEC)),
                    dispatch_get_main_queue(), ^{
-        [self postNotification:IOS_MCP_DARWIN_NOTIFICATION_START];
-
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(900 * NSEC_PER_MSEC)),
-                       dispatch_get_main_queue(), ^{
-            [self refreshServerStatus];
-        });
+        [self refreshServerStatus];
     });
 }
 
