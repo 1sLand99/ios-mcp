@@ -3554,6 +3554,7 @@ static NSString *MCPLogId(id reqId) {
             result[@"memoryFreeMB"] = @(freeMemory / (1024.0 * 1024.0));
             result[@"memoryTotalMB"] = @(totalMemory / (1024.0 * 1024.0));
         }
+        mach_port_deallocate(mach_task_self(), host);
 
         // Screen
         UIScreen *screen = [UIScreen mainScreen];
