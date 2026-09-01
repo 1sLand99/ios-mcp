@@ -14,7 +14,7 @@
 } while (0)
 
 typedef struct __IOSurface *IOSurfaceRef;
-typedef UIImage *(*UICreateScreenUIImageFunc)(void);
+typedef UIImage * NS_RETURNS_RETAINED (*UICreateScreenUIImageFunc)(void);
 typedef CGImageRef (*UICreateCGImageFromIOSurfaceFunc)(IOSurfaceRef surface);
 typedef CGImageRef (*CARenderServerCaptureDisplayFunc)(uint32_t serverPort, CFStringRef displayName, CFDictionaryRef options);
 

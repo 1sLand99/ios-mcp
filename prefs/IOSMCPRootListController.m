@@ -1,5 +1,6 @@
 #import "IOSMCPRootListController.h"
 #import <Preferences/PSSpecifier.h>
+#import <Preferences/PSTableCell.h>
 #import <UIKit/UIKit.h>
 #import <spawn.h>
 #include <string.h>
@@ -10,18 +11,28 @@
 @interface IOSMCPRootListController () <UIGestureRecognizerDelegate, UITextFieldDelegate>
 
 @property (nonatomic, assign) BOOL serverRunning;
+@property (nonatomic, assign) BOOL serverControlBusy;
+@property (nonatomic, assign) NSUInteger serverStatusGeneration;
 @property (nonatomic, strong) UITapGestureRecognizer *keyboardDismissTapGesture;
 @property (nonatomic, weak) id<UITextFieldDelegate> originalPortTextFieldDelegate;
 
 - (void)applyPortChangeFromPort:(uint16_t)previousPort toPort:(uint16_t)newPort;
 - (void)configurePortTextField;
 - (void)dismissKeyboardFromTap:(UITapGestureRecognizer *)gestureRecognizer;
+- (void)fetchServerRunningOnPort:(uint16_t)port completion:(void (^)(BOOL running, NSError *error))completion;
 - (void)installKeyboardDismissGestureIfNeeded;
 - (BOOL)isPortTextField:(UITextField *)textField;
+- (UILabel *)labelInView:(UIView *)view;
+- (void)pollServerStatusExpectingRunning:(BOOL)expectedRunning
+                                    port:(uint16_t)port
+                              generation:(NSUInteger)generation
+                            finalAttempt:(BOOL)finalAttempt;
 - (UITableViewCell *)portPreferenceCell;
 - (void)portTextFieldDidEndOnExit:(UITextField *)textField;
 - (void)respringButtonTapped:(id)sender;
 - (UITextField *)textFieldInView:(UIView *)view;
+- (void)updateVisibleFooterText:(NSString *)text forSpecifier:(PSSpecifier *)specifier;
+- (void)setServerControlBusyState:(BOOL)busy;
 
 @end
 
@@ -69,6 +80,25 @@ static NSString *IOSMCPKillallPath(void) {
         }
     }
     return nil;
+}
+
+static BOOL IOSMCPEnabledPreference(void) {
+    CFPreferencesAppSynchronize((__bridge CFStringRef)IOS_MCP_PREFERENCES_DOMAIN);
+    CFPropertyListRef value = CFPreferencesCopyAppValue((__bridge CFStringRef)IOS_MCP_ENABLED_PREFERENCE_KEY,
+                                                        (__bridge CFStringRef)IOS_MCP_PREFERENCES_DOMAIN);
+    if (!value) return YES;
+
+    BOOL enabled = YES;
+    CFTypeID typeID = CFGetTypeID(value);
+    if (typeID == CFBooleanGetTypeID()) {
+        enabled = CFBooleanGetValue((CFBooleanRef)value);
+    } else if (typeID == CFNumberGetTypeID()) {
+        int numericValue = 0;
+        CFNumberGetValue((CFNumberRef)value, kCFNumberIntType, &numericValue);
+        enabled = numericValue != 0;
+    }
+    CFRelease(value);
+    return enabled;
 }
 
 @implementation IOSMCPRootListController
@@ -163,7 +193,7 @@ static NSString *IOSMCPKillallPath(void) {
                                   IOS_MCP_DEFAULT_PORT]];
     }
 
-    if (previousPort != newPort && self.serverRunning) {
+    if (previousPort != newPort && IOSMCPEnabledPreference()) {
         [self applyPortChangeFromPort:previousPort toPort:newPort];
     } else {
         [self refreshServerStatus];
@@ -171,21 +201,35 @@ static NSString *IOSMCPKillallPath(void) {
 }
 
 - (void)toggleServer:(PSSpecifier *)specifier {
+    if (self.serverControlBusy) {
+        [self deselectSpecifier:specifier];
+        return;
+    }
+
     BOOL shouldStart = !self.serverRunning;
     uint16_t port = IOSMCPConfiguredPort();
+    NSUInteger generation = ++self.serverStatusGeneration;
+    [self deselectSpecifier:specifier];
+    [self setServerControlBusyState:YES];
     [self updateEnabledPreference:shouldStart];
     [self postNotification:shouldStart ? IOS_MCP_DARWIN_NOTIFICATION_START : IOS_MCP_DARWIN_NOTIFICATION_STOP];
     [self updateControlStatusText:shouldStart ? [NSString stringWithFormat:@"当前状态：正在启动端口 %u...", (unsigned int)port] : @"当前状态：正在关闭..."
                       buttonTitle:shouldStart ? @"正在启动..." : @"正在关闭..."
-                    buttonEnabled:NO];
+                    buttonEnabled:YES];
 
-    [self showAlertWithTitle:shouldStart ? @"iOS MCP 已启动" : @"iOS MCP 已关闭"
-                     message:shouldStart ? [NSString stringWithFormat:@"服务已经在端口 %u 启动，并会在下次 SpringBoard 启动后自动开启。", (unsigned int)port]
-                                        : @"服务已经停止，并会保持关闭状态，直到你再次手动启动。"];
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(800 * NSEC_PER_MSEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1000 * NSEC_PER_MSEC)),
                    dispatch_get_main_queue(), ^{
-        [self refreshServerStatus];
+        [self pollServerStatusExpectingRunning:shouldStart
+                                          port:port
+                                    generation:generation
+                                  finalAttempt:NO];
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3000 * NSEC_PER_MSEC)),
+                   dispatch_get_main_queue(), ^{
+        [self pollServerStatusExpectingRunning:shouldStart
+                                          port:port
+                                    generation:generation
+                                  finalAttempt:YES];
     });
 }
 
@@ -735,42 +779,84 @@ static NSString *IOSMCPKillallPath(void) {
 }
 
 - (void)refreshServerStatus {
-    [self updateControlStatusText:@"当前状态：检测中..."
-                      buttonTitle:@"检测中..."
-                    buttonEnabled:NO];
-
+    NSUInteger generation = ++self.serverStatusGeneration;
     uint16_t port = IOSMCPConfiguredPort();
-    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"http://127.0.0.1:%u/health", (unsigned int)port]];
-    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
-    request.timeoutInterval = 1.0;
-    request.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
-
-    NSURLSessionConfiguration *configuration = [NSURLSessionConfiguration ephemeralSessionConfiguration];
-    configuration.timeoutIntervalForRequest = 1.0;
-    configuration.timeoutIntervalForResource = 1.0;
-
+    [self setServerControlBusyState:YES];
     __weak typeof(self) weakSelf = self;
-    NSURLSession *session = [NSURLSession sessionWithConfiguration:configuration];
-    NSURLSessionDataTask *task = [session dataTaskWithRequest:request
-                                            completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+    [self fetchServerRunningOnPort:port completion:^(BOOL running, NSError *error) {
         __strong typeof(weakSelf) self = weakSelf;
-        if (!self) {
-            [session finishTasksAndInvalidate];
+        if (!self || generation != self.serverStatusGeneration || port != IOSMCPConfiguredPort()) {
             return;
         }
 
-        BOOL running = [self isHealthyServerResponseData:data response:response error:error];
-        dispatch_async(dispatch_get_main_queue(), ^{
-            self.serverRunning = running;
-            [self updateControlStatusText:running ? [NSString stringWithFormat:@"当前状态：运行中（端口 %u）", (unsigned int)port]
-                                             : [NSString stringWithFormat:@"当前状态：未运行（端口 %u）", (unsigned int)port]
+        self.serverRunning = running;
+        NSString *stoppedText = (error.code == NSURLErrorTimedOut)
+            ? [NSString stringWithFormat:@"当前状态：端口 %u 无响应", (unsigned int)port]
+            : [NSString stringWithFormat:@"当前状态：未运行（端口 %u）", (unsigned int)port];
+        [self updateControlStatusText:running ? [NSString stringWithFormat:@"当前状态：运行中（端口 %u）", (unsigned int)port]
+                                             : stoppedText
                               buttonTitle:running ? @"关闭 iOS MCP" : @"启动 iOS MCP"
                             buttonEnabled:YES];
+        [self setServerControlBusyState:NO];
+    }];
+}
+
+- (void)fetchServerRunningOnPort:(uint16_t)port completion:(void (^)(BOOL running, NSError *error))completion {
+    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"http://127.0.0.1:%u/health", (unsigned int)port]];
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url];
+    request.timeoutInterval = 5.0;
+    request.cachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+
+    NSURLSessionConfiguration *configuration = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+    configuration.timeoutIntervalForRequest = 5.0;
+    configuration.timeoutIntervalForResource = 6.0;
+
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:configuration];
+    NSURLSessionDataTask *task = [session dataTaskWithRequest:request
+                                            completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+        BOOL running = [self isHealthyServerResponseData:data response:response error:error];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (completion) {
+                completion(running, error);
+            }
         });
 
         [session finishTasksAndInvalidate];
     }];
     [task resume];
+}
+
+- (void)pollServerStatusExpectingRunning:(BOOL)expectedRunning
+                                    port:(uint16_t)port
+                              generation:(NSUInteger)generation
+                            finalAttempt:(BOOL)finalAttempt {
+    if (generation != self.serverStatusGeneration || port != IOSMCPConfiguredPort()) {
+        return;
+    }
+
+    __weak typeof(self) weakSelf = self;
+    [self fetchServerRunningOnPort:port completion:^(BOOL running, NSError *error) {
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self || generation != self.serverStatusGeneration || port != IOSMCPConfiguredPort()) {
+            return;
+        }
+        if (running != expectedRunning && !finalAttempt) {
+            return;
+        }
+
+        // Finalizing invalidates the fallback poll that has not fired yet, or
+        // any slower request from the same toggle operation.
+        self.serverStatusGeneration++;
+        self.serverRunning = running;
+        NSString *stoppedText = (error.code == NSURLErrorTimedOut)
+            ? [NSString stringWithFormat:@"当前状态：端口 %u 无响应", (unsigned int)port]
+            : [NSString stringWithFormat:@"当前状态：未运行（端口 %u）", (unsigned int)port];
+        [self updateControlStatusText:running ? [NSString stringWithFormat:@"当前状态：运行中（端口 %u）", (unsigned int)port]
+                                             : stoppedText
+                              buttonTitle:running ? @"关闭 iOS MCP" : @"启动 iOS MCP"
+                            buttonEnabled:YES];
+        [self setServerControlBusyState:NO];
+    }];
 }
 
 - (void)applyPortChangeFromPort:(uint16_t)previousPort toPort:(uint16_t)newPort {
@@ -785,19 +871,28 @@ static NSString *IOSMCPKillallPath(void) {
      (unsigned int)previousPort,
      (unsigned int)newPort];
 
+    NSUInteger generation = ++self.serverStatusGeneration;
+    [self setServerControlBusyState:YES];
     [self updateControlStatusText:[NSString stringWithFormat:@"当前状态：正在切换到端口 %u...", (unsigned int)newPort]
                       buttonTitle:@"正在切换..."
-                    buttonEnabled:NO];
-    [self postNotification:IOS_MCP_DARWIN_NOTIFICATION_STOP];
+                    buttonEnabled:YES];
+    // START is handled as a serialized restart in SpringBoard. Do not guess
+    // when an asynchronous dispatch-source cancellation has closed the old fd.
+    [self postNotification:IOS_MCP_DARWIN_NOTIFICATION_START];
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(500 * NSEC_PER_MSEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1000 * NSEC_PER_MSEC)),
                    dispatch_get_main_queue(), ^{
-        [self postNotification:IOS_MCP_DARWIN_NOTIFICATION_START];
-
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(900 * NSEC_PER_MSEC)),
-                       dispatch_get_main_queue(), ^{
-            [self refreshServerStatus];
-        });
+        [self pollServerStatusExpectingRunning:YES
+                                          port:newPort
+                                    generation:generation
+                                  finalAttempt:NO];
+    });
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3000 * NSEC_PER_MSEC)),
+                   dispatch_get_main_queue(), ^{
+        [self pollServerStatusExpectingRunning:YES
+                                          port:newPort
+                                    generation:generation
+                                  finalAttempt:YES];
     });
 }
 
@@ -993,6 +1088,52 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherG
     return nil;
 }
 
+- (UILabel *)labelInView:(UIView *)view {
+    if ([view isKindOfClass:[UILabel class]]) {
+        return (UILabel *)view;
+    }
+
+    for (UIView *subview in view.subviews) {
+        UILabel *label = [self labelInView:subview];
+        if (label) {
+            return label;
+        }
+    }
+    return nil;
+}
+
+- (void)updateVisibleFooterText:(NSString *)text forSpecifier:(PSSpecifier *)specifier {
+    NSInteger group = NSNotFound;
+    NSInteger row = NSNotFound;
+    if (!specifier || ![self getGroup:&group row:&row ofSpecifier:specifier] || group == NSNotFound) {
+        return;
+    }
+
+    UITableView *tableView = self.table;
+    UIView *footerView = [tableView footerViewForSection:group];
+    UILabel *footerLabel = nil;
+    if ([footerView isKindOfClass:[UITableViewHeaderFooterView class]]) {
+        footerLabel = ((UITableViewHeaderFooterView *)footerView).textLabel;
+    }
+    footerLabel = footerLabel ?: [self labelInView:footerView];
+    if (footerLabel && ![footerLabel.text isEqualToString:text]) {
+        footerLabel.text = text;
+        [footerView setNeedsLayout];
+    }
+}
+
+- (void)setServerControlBusyState:(BOOL)busy {
+    self.serverControlBusy = busy;
+
+    PSSpecifier *toggleSpecifier = [self specifierForID:@"toggleServerButton"];
+    NSNumber *enabledValue = [toggleSpecifier propertyForKey:PSEnabledKey];
+    BOOL enabled = enabledValue ? enabledValue.boolValue : YES;
+    PSTableCell *toggleCell = [self cachedCellForSpecifier:toggleSpecifier];
+    if (toggleCell) {
+        toggleCell.userInteractionEnabled = enabled && !busy;
+    }
+}
+
 - (BOOL)isHealthyServerResponseData:(NSData *)data response:(NSURLResponse *)response error:(NSError *)error {
     if (error || !data) {
         return NO;
@@ -1049,15 +1190,35 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherG
     PSSpecifier *toggleSpecifier = [self specifierForID:@"toggleServerButton"];
 
     if (groupSpecifier) {
-        [groupSpecifier setProperty:statusText forKey:PSFooterTextGroupKey];
-        [self reloadSpecifier:groupSpecifier animated:NO];
+        NSString *currentStatus = [groupSpecifier propertyForKey:PSFooterTextGroupKey];
+        if (![currentStatus isEqualToString:statusText]) {
+            [groupSpecifier setProperty:statusText forKey:PSFooterTextGroupKey];
+            [self updateVisibleFooterText:statusText forSpecifier:toggleSpecifier];
+        }
     }
 
     if (toggleSpecifier) {
+        NSString *currentTitle = [toggleSpecifier propertyForKey:PSTitleKey] ?: toggleSpecifier.name;
+        NSNumber *currentEnabledValue = [toggleSpecifier propertyForKey:PSEnabledKey];
+        BOOL currentEnabled = currentEnabledValue ? currentEnabledValue.boolValue : YES;
+        BOOL titleChanged = ![currentTitle isEqualToString:buttonTitle];
+        BOOL enabledChanged = currentEnabled != buttonEnabled;
+
         toggleSpecifier.name = buttonTitle;
         [toggleSpecifier setProperty:buttonTitle forKey:PSTitleKey];
         [toggleSpecifier setProperty:@(buttonEnabled) forKey:PSEnabledKey];
-        [self reloadSpecifier:toggleSpecifier animated:NO];
+        if (titleChanged || enabledChanged) {
+            PSTableCell *toggleCell = [self cachedCellForSpecifier:toggleSpecifier];
+            if (toggleCell) {
+                [UIView performWithoutAnimation:^{
+                    [toggleCell refreshCellContentsWithSpecifier:toggleSpecifier];
+                    toggleCell.cellEnabled = buttonEnabled;
+                    toggleCell.userInteractionEnabled = buttonEnabled && !self.serverControlBusy;
+                    [toggleCell setNeedsLayout];
+                    [toggleCell layoutIfNeeded];
+                }];
+            }
+        }
     }
 }
 

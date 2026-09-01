@@ -22,6 +22,7 @@
 #import <sys/statvfs.h>
 #import <sys/stat.h>
 #import <sys/wait.h>
+#import <poll.h>
 #import <mach/mach.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -30,12 +31,23 @@
 #define MCP_PROTOCOL_VERSION_LATEST @"2025-11-25"
 #define MCP_PROTOCOL_VERSION_LEGACY @"2025-03-26"
 #define MCP_SERVER_NAME             @"ios-mcp"
-#define MCP_SERVER_VERSION          @"1.2.3"
+#define MCP_SERVER_VERSION          @"1.2.4"
 #define HTTP_BUF_SIZE        (256 * 1024)
 #define MCP_MAX_CHUNK_LINE   (8 * 1024)
 #define MCP_UPLOAD_DIR       @"/var/mobile/Library/Caches/ios-mcp-uploads"
 #define MCP_MAX_UPLOAD_BYTES (500LL * 1024LL * 1024LL)
 #define MCP_UPLOAD_CHUNK     (64 * 1024)
+#define MCP_CLIENT_READ_TIMEOUT_SECONDS 10
+#define MCP_CLIENT_SEND_TIMEOUT_SECONDS 3
+#define MCP_DOWNLOAD_SEND_TIMEOUT_SECONDS 15
+#define MCP_MAX_ACCEPTS_PER_EVENT 32
+#define MCP_MAX_ACTIVE_CLIENTS 64
+#define MCP_ACCEPT_RESOURCE_BACKOFF_MS 250
+#define MCP_LARGE_WRITE_THRESHOLD (64 * 1024)
+#define MCP_MAX_CONCURRENT_LARGE_RESPONSES 16
+#define MCP_START_RETRY_INITIAL_MS 250
+#define MCP_START_RETRY_MAX_MS 5000
+#define MCP_START_RETRY_MAX_ATTEMPTS 8
 #define MCP_LOG(fmt, ...) do { \
     if ([MCPLogger isDebugLoggingEnabled]) { \
         NSString *message = [NSString stringWithFormat:(fmt), ##__VA_ARGS__]; \
@@ -44,12 +56,62 @@
     } \
 } while (0)
 
-static void MCPSetCloseOnExec(int fd) {
-    if (fd < 0) return;
-    int flags = fcntl(fd, F_GETFD, 0);
-    if (flags >= 0) {
-        fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
+static BOOL MCPSetCloseOnExec(int fd) {
+    if (fd < 0) {
+        errno = EBADF;
+        return NO;
     }
+    int flags = fcntl(fd, F_GETFD, 0);
+    if (flags < 0) return NO;
+    return fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0;
+}
+
+static BOOL MCPConfigureAcceptedSocket(int fd) {
+    if (!MCPSetCloseOnExec(fd)) return NO;
+
+    // Request sockets use blocking reads with explicit timeouts. Clear
+    // O_NONBLOCK in case this platform inherited it from the listener.
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return NO;
+    if ((flags & O_NONBLOCK) && fcntl(fd, F_SETFL, flags & ~O_NONBLOCK) < 0) {
+        return NO;
+    }
+
+    struct timeval readTimeout = {
+        .tv_sec = MCP_CLIENT_READ_TIMEOUT_SECONDS,
+        .tv_usec = 0
+    };
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &readTimeout, sizeof(readTimeout)) < 0) {
+        return NO;
+    }
+
+    int noSigPipe = 1;
+    if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, sizeof(noSigPipe)) < 0) {
+        MCP_LOG(@"Failed to set SO_NOSIGPIPE on client socket %d: %s", fd, strerror(errno));
+    }
+
+    struct timeval sendTimeout = {
+        .tv_sec = MCP_CLIENT_SEND_TIMEOUT_SECONDS,
+        .tv_usec = 0
+    };
+    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &sendTimeout, sizeof(sendTimeout)) < 0) {
+        MCP_LOG(@"Failed to set SO_SNDTIMEO on client socket %d: %s", fd, strerror(errno));
+    }
+    return YES;
+}
+
+static void MCPRejectOverloadedSocket(int fd) {
+    if (fd < 0) return;
+
+    static const char response[] =
+        "HTTP/1.1 503 Service Unavailable\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: 26\r\n"
+        "Retry-After: 1\r\n"
+        "Connection: close\r\n"
+        "\r\n"
+        "{\"error\":\"Server is busy\"}";
+    send(fd, response, sizeof(response) - 1, MSG_DONTWAIT | MSG_NOSIGNAL);
 }
 
 static BOOL MCPNumberFromArgs(NSDictionary *args, NSString *key, double defaultValue, BOOL required, double *outValue, NSString **outError) {
@@ -628,12 +690,30 @@ static NSDictionary *MCPElementSummary(NSDictionary *element) {
 }
 
 
+typedef NS_ENUM(NSUInteger, MCPServerLifecycleState) {
+    MCPServerLifecycleStateStopped = 0,
+    MCPServerLifecycleStateStarting,
+    MCPServerLifecycleStateRunning,
+    MCPServerLifecycleStateStopping,
+};
+
+static const void *MCPServerLifecycleQueueKey = &MCPServerLifecycleQueueKey;
+
 @interface MCPServer ()
 + (instancetype)sharedInstance;
 - (instancetype)init;
 - (void)startOnPort:(uint16_t)port;
+- (void)restartOnPort:(uint16_t)port;
 - (void)stop;
-- (void)handleClient:(int)clientSocket;
+- (void)performLifecycleSync:(dispatch_block_t)block;
+- (void)startListenerLockedOnPort:(uint16_t)port;
+- (void)scheduleStartRetryLockedOnPort:(uint16_t)port error:(int)errorNumber;
+- (void)beginStopLocked;
+- (void)listenerDidCloseSocketLocked:(int)socket generation:(uint64_t)generation;
+- (void)acceptClientsLockedFromSocket:(int)socket generation:(uint64_t)generation;
+- (void)backoffAcceptSourceLockedForSocket:(int)socket generation:(uint64_t)generation;
+- (void)shutdownActiveClientsLocked;
+- (void)handleClient:(int)clientSocket listenerPort:(uint16_t)listenerPort;
 - (NSString *)uploadFileNameFromRequestPath:(NSString *)path headers:(NSDictionary *)headers;
 - (void)handleUploadFileRequestPath:(NSString *)path
                              headers:(NSDictionary *)headers
@@ -716,15 +796,31 @@ static NSDictionary *MCPElementSummary(NSDictionary *element) {
 - (void)sendErrorResponse:(int)socket status:(int)status message:(NSString *)message requestLogId:(NSString *)requestLogId;
 - (void)sendMethodNotAllowedResponse:(int)socket allowedMethods:(NSString *)allowedMethods message:(NSString *)message requestLogId:(NSString *)requestLogId;
 - (void)sendEmptyResponse:(int)socket status:(int)status requestLogId:(NSString *)requestLogId;
-- (void)writeAll:(int)socket data:(NSData *)data requestLogId:(NSString *)requestLogId;
+- (BOOL)writeAll:(int)socket data:(NSData *)data requestLogId:(NSString *)requestLogId;
+- (BOOL)writeAll:(int)socket data:(NSData *)data noProgressTimeout:(NSTimeInterval)timeout requestLogId:(NSString *)requestLogId;
+- (BOOL)tryAcquireLargeResponseSlotForSocket:(int)socket bytes:(unsigned long long)bytes requestLogId:(NSString *)requestLogId;
+- (void)releaseLargeResponseSlot;
 - (NSString *)negotiatedProtocolVersion;
 - (void)setNegotiatedProtocolVersion:(NSString *)version;
 @end
 
 @implementation MCPServer {
+    uint16_t _port;
+    BOOL _running;
     int _serverSocket;
     dispatch_source_t _acceptSource;
+    dispatch_queue_t _lifecycleQueue;
     dispatch_queue_t _clientQueue;
+    dispatch_semaphore_t _largeResponseSemaphore;
+    MCPServerLifecycleState _lifecycleState;
+    BOOL _acceptSourceSuspended;
+    BOOL _desiredRunning;
+    uint16_t _desiredPort;
+    uint64_t _listenerGeneration;
+    uint64_t _startRetryToken;
+    NSUInteger _startRetryAttempt;
+    uint64_t _nextClientIdentifier;
+    NSMutableDictionary<NSNumber *, NSNumber *> *_activeClients;
     NSString *_sessionId;
     NSString *_negotiatedProtocolVersion;
 }
@@ -742,7 +838,15 @@ static NSDictionary *MCPElementSummary(NSDictionary *element) {
     self = [super init];
     if (self) {
         _serverSocket = -1;
+        _lifecycleQueue = dispatch_queue_create("com.witchan.ios-mcp.lifecycle", DISPATCH_QUEUE_SERIAL);
+        dispatch_queue_set_specific(_lifecycleQueue,
+                                    MCPServerLifecycleQueueKey,
+                                    (void *)MCPServerLifecycleQueueKey,
+                                    NULL);
         _clientQueue = dispatch_queue_create("com.witchan.ios-mcp.client", DISPATCH_QUEUE_CONCURRENT);
+        _largeResponseSemaphore = dispatch_semaphore_create(MCP_MAX_CONCURRENT_LARGE_RESPONSES);
+        _lifecycleState = MCPServerLifecycleStateStopped;
+        _activeClients = [NSMutableDictionary dictionary];
         _sessionId = [[NSUUID UUID] UUIDString];
         _negotiatedProtocolVersion = MCP_PROTOCOL_VERSION_LATEST;
     }
@@ -766,22 +870,109 @@ static NSDictionary *MCPElementSummary(NSDictionary *element) {
 
 #pragma mark - Server Lifecycle
 
-- (void)startOnPort:(uint16_t)port {
-    if (_running) {
-        if (_port == port) {
-            MCP_LOG(@"MCP server already running on port %d; start skipped", port);
-        } else {
-            MCP_LOG(@"MCP server already running on port %d; ignoring start on port %d", _port, port);
-        }
-        return;
+- (void)performLifecycleSync:(dispatch_block_t)block {
+    if (!block) return;
+    if (dispatch_get_specific(MCPServerLifecycleQueueKey)) {
+        block();
+    } else {
+        dispatch_sync(_lifecycleQueue, block);
     }
+}
+
+- (uint16_t)port {
+    __block uint16_t port = 0;
+    [self performLifecycleSync:^{
+        port = self->_port;
+    }];
+    return port;
+}
+
+- (BOOL)isRunning {
+    __block BOOL running = NO;
+    [self performLifecycleSync:^{
+        running = self->_running;
+    }];
+    return running;
+}
+
+- (void)startOnPort:(uint16_t)port {
+    [self performLifecycleSync:^{
+        self->_desiredRunning = YES;
+        self->_desiredPort = port;
+
+        if (self->_lifecycleState == MCPServerLifecycleStateStopped) {
+            self->_startRetryToken++;
+            self->_startRetryAttempt = 0;
+            [self startListenerLockedOnPort:port];
+            return;
+        }
+
+        if (self->_lifecycleState == MCPServerLifecycleStateRunning) {
+            if (self->_port == port) {
+                MCP_LOG(@"MCP server already running on port %d; start skipped", port);
+            } else {
+                MCP_LOG(@"MCP server switching from port %d to port %d", self->_port, port);
+                [self beginStopLocked];
+            }
+            return;
+        }
+
+        MCP_LOG(@"MCP server start deferred while lifecycle state=%lu port=%d",
+                (unsigned long)self->_lifecycleState,
+                port);
+    }];
+}
+
+- (void)restartOnPort:(uint16_t)port {
+    [self performLifecycleSync:^{
+        self->_desiredRunning = YES;
+        self->_desiredPort = port;
+
+        if (self->_lifecycleState == MCPServerLifecycleStateStopped) {
+            self->_startRetryToken++;
+            self->_startRetryAttempt = 0;
+            [self startListenerLockedOnPort:port];
+        } else if (self->_lifecycleState == MCPServerLifecycleStateRunning) {
+            MCP_LOG(@"MCP server restart requested on port %d", port);
+            [self beginStopLocked];
+        } else {
+            MCP_LOG(@"MCP server restart queued while lifecycle state=%lu port=%d",
+                    (unsigned long)self->_lifecycleState,
+                    port);
+        }
+    }];
+}
+
+- (void)startListenerLockedOnPort:(uint16_t)port {
+    if (_lifecycleState != MCPServerLifecycleStateStopped) return;
+    _lifecycleState = MCPServerLifecycleStateStarting;
 
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     if (sock < 0) {
-        MCP_LOG(@"Failed to create socket: %s", strerror(errno));
+        int socketError = errno;
+        MCP_LOG(@"Failed to create socket: %s", strerror(socketError));
+        _lifecycleState = MCPServerLifecycleStateStopped;
+        [self scheduleStartRetryLockedOnPort:port error:socketError];
         return;
     }
-    MCPSetCloseOnExec(sock);
+    if (!MCPSetCloseOnExec(sock)) {
+        int socketError = errno;
+        MCP_LOG(@"Failed to set close-on-exec on listener: %s", strerror(socketError));
+        close(sock);
+        _lifecycleState = MCPServerLifecycleStateStopped;
+        [self scheduleStartRetryLockedOnPort:port error:socketError];
+        return;
+    }
+
+    int socketFlags = fcntl(sock, F_GETFL, 0);
+    if (socketFlags < 0 || fcntl(sock, F_SETFL, socketFlags | O_NONBLOCK) < 0) {
+        int socketError = errno;
+        MCP_LOG(@"Failed to make listener non-blocking: %s", strerror(socketError));
+        close(sock);
+        _lifecycleState = MCPServerLifecycleStateStopped;
+        [self scheduleStartRetryLockedOnPort:port error:socketError];
+        return;
+    }
 
     int reuse = 1;
     setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
@@ -793,68 +984,260 @@ static NSDictionary *MCPElementSummary(NSDictionary *element) {
     addr.sin_addr.s_addr = INADDR_ANY;
 
     if (bind(sock, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        MCP_LOG(@"Failed to bind on port %d: %s", port, strerror(errno));
+        int socketError = errno;
+        MCP_LOG(@"Failed to bind on port %d: %s", port, strerror(socketError));
         close(sock);
+        _lifecycleState = MCPServerLifecycleStateStopped;
+        [self scheduleStartRetryLockedOnPort:port error:socketError];
         return;
     }
 
-    if (listen(sock, 8) < 0) {
-        MCP_LOG(@"Failed to listen: %s", strerror(errno));
+    if (listen(sock, MCP_MAX_ACTIVE_CLIENTS) < 0) {
+        int socketError = errno;
+        MCP_LOG(@"Failed to listen: %s", strerror(socketError));
         close(sock);
+        _lifecycleState = MCPServerLifecycleStateStopped;
+        [self scheduleStartRetryLockedOnPort:port error:socketError];
         return;
     }
 
-    _serverSocket = sock;
-    _port = port;
-    _running = YES;
+    dispatch_source_t source = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ,
+                                                      sock,
+                                                      0,
+                                                      _lifecycleQueue);
+    if (!source) {
+        MCP_LOG(@"Failed to create listener dispatch source on port %d", port);
+        close(sock);
+        _lifecycleState = MCPServerLifecycleStateStopped;
+        [self scheduleStartRetryLockedOnPort:port error:ENOMEM];
+        return;
+    }
 
-    dispatch_queue_t queue = dispatch_queue_create("com.witchan.ios-mcp.accept", DISPATCH_QUEUE_CONCURRENT);
-    _acceptSource = dispatch_source_create(DISPATCH_SOURCE_TYPE_READ, sock, 0, queue);
+    uint64_t generation = ++_listenerGeneration;
 
     __weak typeof(self) weakSelf = self;
-    dispatch_source_set_event_handler(_acceptSource, ^{
+    dispatch_source_set_event_handler(source, ^{
         __strong typeof(weakSelf) self = weakSelf;
         if (!self) return;
-        int client = accept(sock, NULL, NULL);
-        if (client >= 0) {
-            MCPSetCloseOnExec(client);
-            dispatch_async(self->_clientQueue, ^{
-                [self handleClient:client];
-            });
-        }
+        [self acceptClientsLockedFromSocket:sock generation:generation];
     });
 
-    dispatch_source_set_cancel_handler(_acceptSource, ^{
+    dispatch_source_set_cancel_handler(source, ^{
         close(sock);
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self) return;
+        [self listenerDidCloseSocketLocked:sock generation:generation];
     });
 
-    dispatch_resume(_acceptSource);
+    _serverSocket = sock;
+    _acceptSource = source;
+    _port = port;
+    _running = YES;
+    _lifecycleState = MCPServerLifecycleStateRunning;
+    _acceptSourceSuspended = NO;
+    _startRetryToken++;
+    _startRetryAttempt = 0;
+
+    dispatch_resume(source);
     MCP_LOG(@"MCP server started on port %d", port);
 }
 
-- (void)stop {
-    if (!_running) return;
-    _running = NO;
-    if (_acceptSource) {
-        dispatch_source_cancel(_acceptSource);
-        _acceptSource = nil;
+- (void)scheduleStartRetryLockedOnPort:(uint16_t)port error:(int)errorNumber {
+    if (!_desiredRunning || _desiredPort != port ||
+        _lifecycleState != MCPServerLifecycleStateStopped) {
+        return;
     }
+
+    if (_startRetryAttempt >= MCP_START_RETRY_MAX_ATTEMPTS) {
+        MCP_LOG(@"MCP server retry limit reached on port %d after error %d (%s)",
+                port,
+                errorNumber,
+                errorNumber ? strerror(errorNumber) : "unknown");
+        return;
+    }
+    _startRetryAttempt++;
+    NSUInteger shift = MIN(_startRetryAttempt > 0 ? _startRetryAttempt - 1 : 0, (NSUInteger)5);
+    uint64_t delayMs = MIN((uint64_t)MCP_START_RETRY_INITIAL_MS << shift,
+                           (uint64_t)MCP_START_RETRY_MAX_MS);
+    uint64_t token = ++_startRetryToken;
+
+    MCP_LOG(@"MCP server retry scheduled on port %d in %llu ms after error %d (%s)",
+            port,
+            (unsigned long long)delayMs,
+            errorNumber,
+            errorNumber ? strerror(errorNumber) : "unknown");
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delayMs * NSEC_PER_MSEC)),
+                   _lifecycleQueue,
+                   ^{
+        if (self->_startRetryToken != token ||
+            !self->_desiredRunning ||
+            self->_desiredPort != port ||
+            self->_lifecycleState != MCPServerLifecycleStateStopped) {
+            return;
+        }
+        [self startListenerLockedOnPort:port];
+    });
+}
+
+- (void)stop {
+    [self performLifecycleSync:^{
+        self->_desiredRunning = NO;
+        self->_startRetryToken++;
+        self->_startRetryAttempt = 0;
+        if (self->_lifecycleState == MCPServerLifecycleStateRunning) {
+            [self beginStopLocked];
+        } else if (self->_lifecycleState == MCPServerLifecycleStateStopping) {
+            [self shutdownActiveClientsLocked];
+        }
+    }];
+}
+
+- (void)beginStopLocked {
+    if (_lifecycleState != MCPServerLifecycleStateRunning) return;
+
+    _lifecycleState = MCPServerLifecycleStateStopping;
+    _running = NO;
+    [self shutdownActiveClientsLocked];
+
+    if (_acceptSource) {
+        if (_acceptSourceSuspended) {
+            _acceptSourceSuspended = NO;
+            dispatch_resume(_acceptSource);
+        }
+        dispatch_source_cancel(_acceptSource);
+    } else {
+        int socket = _serverSocket;
+        uint64_t generation = _listenerGeneration;
+        if (socket >= 0) close(socket);
+        [self listenerDidCloseSocketLocked:socket generation:generation];
+    }
+    MCP_LOG(@"MCP server stopping");
+}
+
+- (void)listenerDidCloseSocketLocked:(int)socket generation:(uint64_t)generation {
+    if (generation != _listenerGeneration || socket != _serverSocket) return;
+
+    _acceptSource = nil;
     _serverSocket = -1;
+    _port = 0;
+    _running = NO;
+    _lifecycleState = MCPServerLifecycleStateStopped;
+    _acceptSourceSuspended = NO;
     MCP_LOG(@"MCP server stopped");
+
+    if (_desiredRunning) {
+        _startRetryToken++;
+        _startRetryAttempt = 0;
+        [self startListenerLockedOnPort:_desiredPort];
+    }
+}
+
+- (void)acceptClientsLockedFromSocket:(int)socket generation:(uint64_t)generation {
+    if (_lifecycleState != MCPServerLifecycleStateRunning ||
+        generation != _listenerGeneration ||
+        socket != _serverSocket) {
+        return;
+    }
+
+    NSUInteger accepted = 0;
+    while (accepted < MCP_MAX_ACCEPTS_PER_EVENT) {
+        int client = accept(socket, NULL, NULL);
+        if (client < 0) {
+            int acceptError = errno;
+            if (acceptError == EINTR) continue;
+            if (acceptError == EMFILE || acceptError == ENFILE ||
+                acceptError == ENOBUFS || acceptError == ENOMEM) {
+                MCP_LOG(@"Temporarily pausing accepts on port %d after resource error: %s",
+                        _port,
+                        strerror(acceptError));
+                [self backoffAcceptSourceLockedForSocket:socket generation:generation];
+            } else if (acceptError != EAGAIN && acceptError != EWOULDBLOCK) {
+                MCP_LOG(@"Failed to accept client on port %d: %s", _port, strerror(acceptError));
+            }
+            break;
+        }
+        accepted++;
+
+        if (!MCPConfigureAcceptedSocket(client)) {
+            int configurationError = errno;
+            [MCPLogger log:@"client_socket_rejected sock=%d stage=configure errno=%d error=%s",
+             client,
+             configurationError,
+             strerror(configurationError)];
+            close(client);
+            continue;
+        }
+        if (_activeClients.count >= MCP_MAX_ACTIVE_CLIENTS) {
+            MCP_LOG(@"Rejecting client on port %d: active client limit reached (%lu)",
+                    _port,
+                    (unsigned long)_activeClients.count);
+            MCPRejectOverloadedSocket(client);
+            close(client);
+            continue;
+        }
+
+        uint16_t listenerPort = _port;
+        NSNumber *clientIdentifier = @(++_nextClientIdentifier);
+        _activeClients[clientIdentifier] = @(client);
+
+        dispatch_async(_clientQueue, ^{
+            @try {
+                [self handleClient:client listenerPort:listenerPort];
+            } @finally {
+                dispatch_sync(self->_lifecycleQueue, ^{
+                    NSNumber *registeredSocket = self->_activeClients[clientIdentifier];
+                    if (registeredSocket && registeredSocket.intValue == client) {
+                        [self->_activeClients removeObjectForKey:clientIdentifier];
+                    }
+                });
+                close(client);
+            }
+        });
+    }
+}
+
+- (void)backoffAcceptSourceLockedForSocket:(int)socket generation:(uint64_t)generation {
+    if (_acceptSourceSuspended || !_acceptSource ||
+        _lifecycleState != MCPServerLifecycleStateRunning ||
+        generation != _listenerGeneration || socket != _serverSocket) {
+        return;
+    }
+
+    dispatch_source_t source = _acceptSource;
+    _acceptSourceSuspended = YES;
+    dispatch_suspend(source);
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                 (int64_t)MCP_ACCEPT_RESOURCE_BACKOFF_MS * NSEC_PER_MSEC),
+                   _lifecycleQueue,
+                   ^{
+        if (self->_acceptSourceSuspended &&
+            self->_acceptSource == source &&
+            self->_lifecycleState == MCPServerLifecycleStateRunning &&
+            self->_listenerGeneration == generation &&
+            self->_serverSocket == socket) {
+            self->_acceptSourceSuspended = NO;
+            dispatch_resume(source);
+        }
+    });
+}
+
+- (void)shutdownActiveClientsLocked {
+    for (NSNumber *socketNumber in _activeClients.allValues) {
+        int client = socketNumber.intValue;
+        if (client >= 0) shutdown(client, SHUT_RDWR);
+    }
 }
 
 #pragma mark - HTTP Handling
 
-- (void)handleClient:(int)clientSocket {
+- (void)handleClient:(int)clientSocket listenerPort:(uint16_t)listenerPort {
     NSDate *requestStart = [NSDate date];
     NSString *requestLogId = MCPNextLogRequestId();
 
-    // Set read timeout
-    struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
-    setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-
     char *buffer = malloc(HTTP_BUF_SIZE);
-    if (!buffer) { close(clientSocket); return; }
+    if (!buffer) return;
 
     ssize_t totalRead = 0;
     ssize_t headerEnd = -1;
@@ -881,7 +1264,6 @@ static NSDictionary *MCPElementSummary(NSDictionary *element) {
          [[NSDate date] timeIntervalSinceDate:requestStart] * 1000.0];
         [self sendErrorResponse:clientSocket status:400 message:@"Bad Request" requestLogId:requestLogId];
         free(buffer);
-        close(clientSocket);
         return;
     }
 
@@ -940,7 +1322,6 @@ static NSDictionary *MCPElementSummary(NSDictionary *element) {
                              message:[NSString stringWithFormat:@"Unsupported MCP protocol version: %@", protocolVersionHeader]
                         requestLogId:requestLogId];
             free(buffer);
-            close(clientSocket);
             return;
         }
         [self setNegotiatedProtocolVersion:protocolVersionHeader];
@@ -965,13 +1346,11 @@ static NSDictionary *MCPElementSummary(NSDictionary *element) {
             if (!bodyData) {
                 [self sendErrorResponse:clientSocket status:errorStatus message:errorMessage ?: @"Invalid chunked MCP request body" requestLogId:requestLogId];
                 free(buffer);
-                close(clientSocket);
                 return;
             }
 
             [self handleMCPRequest:bodyData clientSocket:clientSocket requestLogId:requestLogId];
             free(buffer);
-            close(clientSocket);
             return;
         }
 
@@ -979,7 +1358,6 @@ static NSDictionary *MCPElementSummary(NSDictionary *element) {
         if (contentLength > HTTP_BUF_SIZE - headerEnd - 1) {
             [self sendErrorResponse:clientSocket status:413 message:@"MCP request body too large" requestLogId:requestLogId];
             free(buffer);
-            close(clientSocket);
             return;
         }
 
@@ -994,7 +1372,6 @@ static NSDictionary *MCPElementSummary(NSDictionary *element) {
         if (bodyReceived < contentLength) {
             [self sendErrorResponse:clientSocket status:400 message:@"Incomplete MCP request body" requestLogId:requestLogId];
             free(buffer);
-            close(clientSocket);
             return;
         }
 
@@ -1021,7 +1398,7 @@ static NSDictionary *MCPElementSummary(NSDictionary *element) {
             @"status": @"ok",
             @"server": MCP_SERVER_NAME,
             @"version": MCP_SERVER_VERSION,
-            @"port": @(_port),
+            @"port": @(listenerPort),
             @"protocolVersion": [self negotiatedProtocolVersion],
             @"supportedProtocolVersions": MCPSupportedProtocolVersions()
         };
@@ -1031,7 +1408,6 @@ static NSDictionary *MCPElementSummary(NSDictionary *element) {
     }
 
     free(buffer);
-    close(clientSocket);
 }
 
 - (NSData *)readChunkedMCPBodyFromSocket:(int)clientSocket
@@ -1309,36 +1685,91 @@ static NSString *MCPQueryParameter(NSString *requestTarget, NSString *key) {
     }
 
     struct stat st;
-    long long fileSize = 0;
-    if (fstat(fd, &st) == 0) fileSize = st.st_size;
-
-    NSString *downloadName = filePath.lastPathComponent ?: @"file";
-    NSString *header = [NSString stringWithFormat:
-        @"HTTP/1.1 200 OK\r\n"
-        @"Content-Type: application/octet-stream\r\n"
-        @"Content-Length: %lld\r\n"
-        @"Content-Disposition: attachment; filename=\"%@\"\r\n"
-        @"Connection: close\r\n"
-        @"\r\n",
-        fileSize, downloadName];
-    [self writeAll:clientSocket data:[header dataUsingEncoding:NSUTF8StringEncoding] requestLogId:requestLogId];
-
-    long long sent = 0;
-    char *chunk = malloc(MCP_UPLOAD_CHUNK);
-    if (chunk) {
-        ssize_t n;
-        while ((n = read(fd, chunk, MCP_UPLOAD_CHUNK)) > 0) {
-            NSData *data = [NSData dataWithBytesNoCopy:chunk length:(NSUInteger)n freeWhenDone:NO];
-            [self writeAll:clientSocket data:data requestLogId:nil];
-            sent += n;
-        }
-        free(chunk);
+    int statResult = fstat(fd, &st);
+    if (statResult < 0 || st.st_size < 0) {
+        int statError = statResult < 0 ? errno : EIO;
+        close(fd);
+        if (isTemporary) [[NSFileManager defaultManager] removeItemAtPath:diskPath error:nil];
+        [self sendErrorResponse:clientSocket
+                          status:500
+                         message:[NSString stringWithFormat:@"Failed to inspect file: %s", strerror(statError)]
+                    requestLogId:requestLogId];
+        return;
     }
-    close(fd);
-    if (isTemporary) [[NSFileManager defaultManager] removeItemAtPath:diskPath error:nil];
+    long long fileSize = st.st_size;
 
-    [MCPLogger log:@"file_download req=%@ sock=%d ok=yes bytes=%lld privilegedTemp=%@",
-     requestLogId ?: @"-", clientSocket, sent, isTemporary ? @"yes" : @"no"];
+    char *chunk = NULL;
+    if (fileSize > 0) {
+        chunk = malloc(MCP_UPLOAD_CHUNK);
+        if (!chunk) {
+            close(fd);
+            if (isTemporary) [[NSFileManager defaultManager] removeItemAtPath:diskPath error:nil];
+            [self sendErrorResponse:clientSocket
+                              status:500
+                             message:@"Failed to allocate download buffer"
+                        requestLogId:requestLogId];
+            return;
+        }
+    }
+
+    BOOL ownsLargeResponseSlot = fileSize >= MCP_LARGE_WRITE_THRESHOLD;
+    if (ownsLargeResponseSlot &&
+        ![self tryAcquireLargeResponseSlotForSocket:clientSocket
+                                              bytes:(unsigned long long)fileSize
+                                       requestLogId:requestLogId]) {
+        if (chunk) free(chunk);
+        close(fd);
+        if (isTemporary) [[NSFileManager defaultManager] removeItemAtPath:diskPath error:nil];
+        [self sendErrorResponse:clientSocket
+                          status:503
+                         message:@"Server is busy; retry the download later"
+                    requestLogId:requestLogId];
+        [MCPLogger log:@"file_download req=%@ sock=%d ok=no bytes=0 privilegedTemp=%@ reason=busy",
+         requestLogId ?: @"-", clientSocket, isTemporary ? @"yes" : @"no"];
+        return;
+    }
+
+    BOOL writeSucceeded = YES;
+    long long sent = 0;
+    @try {
+        NSString *downloadName = filePath.lastPathComponent ?: @"file";
+        NSString *header = [NSString stringWithFormat:
+            @"HTTP/1.1 200 OK\r\n"
+            @"Content-Type: application/octet-stream\r\n"
+            @"Content-Length: %lld\r\n"
+            @"Content-Disposition: attachment; filename=\"%@\"\r\n"
+            @"Connection: close\r\n"
+            @"\r\n",
+            fileSize, downloadName];
+        writeSucceeded = [self writeAll:clientSocket
+                                   data:[header dataUsingEncoding:NSUTF8StringEncoding]
+                      noProgressTimeout:MCP_DOWNLOAD_SEND_TIMEOUT_SECONDS
+                           requestLogId:requestLogId];
+
+        if (chunk && writeSucceeded) {
+            ssize_t n = 0;
+            while ((n = read(fd, chunk, MCP_UPLOAD_CHUNK)) > 0) {
+                NSData *data = [NSData dataWithBytesNoCopy:chunk length:(NSUInteger)n freeWhenDone:NO];
+                if (![self writeAll:clientSocket
+                               data:data
+                  noProgressTimeout:MCP_DOWNLOAD_SEND_TIMEOUT_SECONDS
+                       requestLogId:requestLogId]) {
+                    writeSucceeded = NO;
+                    break;
+                }
+                sent += n;
+            }
+            if (n < 0) writeSucceeded = NO;
+        }
+    } @finally {
+        if (chunk) free(chunk);
+        close(fd);
+        if (isTemporary) [[NSFileManager defaultManager] removeItemAtPath:diskPath error:nil];
+        if (ownsLargeResponseSlot) [self releaseLargeResponseSlot];
+    }
+
+    [MCPLogger log:@"file_download req=%@ sock=%d ok=%@ bytes=%lld privilegedTemp=%@",
+     requestLogId ?: @"-", clientSocket, writeSucceeded ? @"yes" : @"no", sent, isTemporary ? @"yes" : @"no"];
 }
 
 static NSString *MCPRedactedLogText(NSString *s) {
@@ -3554,6 +3985,7 @@ static NSString *MCPLogId(id reqId) {
             result[@"memoryFreeMB"] = @(freeMemory / (1024.0 * 1024.0));
             result[@"memoryTotalMB"] = @(totalMemory / (1024.0 * 1024.0));
         }
+        mach_port_deallocate(mach_task_self(), host);
 
         // Screen
         UIScreen *screen = [UIScreen mainScreen];
@@ -4119,6 +4551,18 @@ static BOOL MCPSetSystemBrightness(CGFloat brightness) {
     NSMutableData *responseData = [NSMutableData dataWithData:[response dataUsingEncoding:NSUTF8StringEncoding]];
     [responseData appendData:jsonData];
 
+    BOOL ownsLargeResponseSlot = responseData.length >= MCP_LARGE_WRITE_THRESHOLD;
+    if (ownsLargeResponseSlot &&
+        ![self tryAcquireLargeResponseSlotForSocket:socket
+                                              bytes:responseData.length
+                                       requestLogId:requestLogId]) {
+        [self sendErrorResponse:socket
+                          status:503
+                         message:@"Server is busy; retry later"
+                    requestLogId:requestLogId];
+        return;
+    }
+
     if (requestLogId.length > 0) {
         [MCPLogger log:@"http_response req=%@ sock=%d status=%d contentType=application/json bytes=%lu",
          requestLogId,
@@ -4126,7 +4570,13 @@ static BOOL MCPSetSystemBrightness(CGFloat brightness) {
          status,
          (unsigned long)responseData.length];
     }
-    [self writeAll:socket data:responseData requestLogId:requestLogId];
+    @try {
+        [self writeAll:socket data:responseData requestLogId:requestLogId];
+    } @finally {
+        if (ownsLargeResponseSlot) {
+            [self releaseLargeResponseSlot];
+        }
+    }
 }
 
 - (void)sendErrorResponse:(int)socket status:(int)status message:(NSString *)message requestLogId:(NSString *)requestLogId {
@@ -4138,6 +4588,7 @@ static BOOL MCPSetSystemBrightness(CGFloat brightness) {
         case 415: statusText = @"Unsupported Media Type"; break;
         case 404: statusText = @"Not Found"; break;
         case 405: statusText = @"Method Not Allowed"; break;
+        case 503: statusText = @"Service Unavailable"; break;
         case 500: statusText = @"Internal Server Error"; break;
         default:  statusText = @"Error"; break;
     }
@@ -4216,29 +4667,109 @@ static BOOL MCPSetSystemBrightness(CGFloat brightness) {
     [self writeAll:socket data:data requestLogId:requestLogId];
 }
 
-- (void)writeAll:(int)socket data:(NSData *)data requestLogId:(NSString *)requestLogId {
+- (BOOL)writeAll:(int)socket data:(NSData *)data requestLogId:(NSString *)requestLogId {
+    return [self writeAll:socket
+                     data:data
+        noProgressTimeout:MCP_CLIENT_SEND_TIMEOUT_SECONDS
+             requestLogId:requestLogId];
+}
+
+- (BOOL)writeAll:(int)socket
+            data:(NSData *)data
+noProgressTimeout:(NSTimeInterval)timeout
+    requestLogId:(NSString *)requestLogId {
     const uint8_t *bytes = data.bytes;
     NSUInteger remaining = data.length;
     NSUInteger offset = 0;
+    NSTimeInterval effectiveTimeout = MAX(0.1, timeout);
+    CFAbsoluteTime progressDeadline = CFAbsoluteTimeGetCurrent() + effectiveTimeout;
 
     while (remaining > 0) {
-        ssize_t written = write(socket, bytes + offset, remaining);
+        ssize_t written = send(socket,
+                               bytes + offset,
+                               remaining,
+                               MSG_DONTWAIT | MSG_NOSIGNAL);
+        if (written > 0) {
+            offset += written;
+            remaining -= written;
+            progressDeadline = CFAbsoluteTimeGetCurrent() + effectiveTimeout;
+            continue;
+        }
+
         if (written < 0 && errno == EINTR) {
             continue;
         }
-        if (written <= 0) {
-            int err = errno;
+
+        if (written < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            NSTimeInterval waitSeconds = progressDeadline - CFAbsoluteTimeGetCurrent();
+            if (waitSeconds <= 0) {
+                [MCPLogger log:@"socket_write_failed req=%@ sock=%d errno=%d error=%s remainingBytes=%lu",
+                 requestLogId ?: @"-",
+                 socket,
+                 ETIMEDOUT,
+                 strerror(ETIMEDOUT),
+                 (unsigned long)remaining];
+                return NO;
+            }
+
+            int timeoutMs = MAX(1, (int)(waitSeconds * 1000.0));
+            struct pollfd descriptor = {
+                .fd = socket,
+                .events = POLLOUT,
+                .revents = 0
+            };
+            int pollResult = poll(&descriptor, 1, timeoutMs);
+            if (pollResult < 0 && errno == EINTR) {
+                continue;
+            }
+            if (pollResult > 0 && !(descriptor.revents & (POLLERR | POLLHUP | POLLNVAL))) {
+                continue;
+            }
+
+            int err = pollResult == 0 ? ETIMEDOUT : errno;
+            if (pollResult > 0) {
+                socklen_t errorLength = sizeof(err);
+                if (getsockopt(socket, SOL_SOCKET, SO_ERROR, &err, &errorLength) < 0 || err == 0) {
+                    err = EPIPE;
+                }
+            }
             [MCPLogger log:@"socket_write_failed req=%@ sock=%d errno=%d error=%s remainingBytes=%lu",
              requestLogId ?: @"-",
              socket,
              err,
              strerror(err),
              (unsigned long)remaining];
-            break;
+            return NO;
         }
-        offset += written;
-        remaining -= written;
+
+        int err = written == 0 ? EPIPE : errno;
+        [MCPLogger log:@"socket_write_failed req=%@ sock=%d errno=%d error=%s remainingBytes=%lu",
+         requestLogId ?: @"-",
+         socket,
+         err,
+         strerror(err),
+         (unsigned long)remaining];
+        return NO;
     }
+    return YES;
+}
+
+- (BOOL)tryAcquireLargeResponseSlotForSocket:(int)socket
+                                       bytes:(unsigned long long)bytes
+                                requestLogId:(NSString *)requestLogId {
+    if (dispatch_semaphore_wait(_largeResponseSemaphore, DISPATCH_TIME_NOW) == 0) {
+        return YES;
+    }
+
+    [MCPLogger log:@"response_rejected req=%@ sock=%d reason=large_response_limit bytes=%llu",
+     requestLogId ?: @"-",
+     socket,
+     bytes];
+    return NO;
+}
+
+- (void)releaseLargeResponseSlot {
+    dispatch_semaphore_signal(_largeResponseSemaphore);
 }
 
 @end

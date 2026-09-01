@@ -218,6 +218,7 @@ static void appendChildTouchEvent(IOHIDEventRef parent, TouchPhase phase, int in
     IOHIDEventRef child = createChildTouchEvent(phase, index, point);
     if (child) {
         IOHIDEventAppendEvent(parent, child, 0);
+        CFRelease(child);
     }
 }
 
