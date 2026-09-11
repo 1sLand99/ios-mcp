@@ -762,8 +762,50 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
     __block BOOL ok = NO;
     __block NSString *errMsg = nil;
 
-    dispatch_block_t block = ^{
-        // Method 1: SBUIController activateApplication (SpringBoard internal)
+    // Prefer LaunchServices from the current client worker. Calling the legacy
+    // SBUIController activation path synchronously on SpringBoard's main queue
+    // can block that queue for several seconds on some iOS versions.
+    Class LSWorkspaceClass = objc_getClass("LSApplicationWorkspace");
+    if (LSWorkspaceClass) {
+        @try {
+            SEL defaultWorkspaceSel = @selector(defaultWorkspace);
+            if (![LSWorkspaceClass respondsToSelector:defaultWorkspaceSel]) {
+                errMsg = @"LSApplicationWorkspace defaultWorkspace is unavailable";
+            } else {
+                id workspace = ((id (*)(id, SEL))objc_msgSend)((id)LSWorkspaceClass, defaultWorkspaceSel);
+                SEL openSel = @selector(openApplicationWithBundleID:);
+                if (!workspace) {
+                    errMsg = @"LSApplicationWorkspace defaultWorkspace returned nil";
+                } else if (![workspace respondsToSelector:openSel]) {
+                    errMsg = @"LSApplicationWorkspace openApplicationWithBundleID: is unavailable";
+                } else {
+                    CFAbsoluteTime startedAt = CFAbsoluteTimeGetCurrent();
+                    BOOL opened = ((BOOL (*)(id, SEL, NSString *))objc_msgSend)(workspace, openSel, bundleId);
+                    APP_LOG(@"LaunchServices launch request for %@ returned %@ in %.0fms",
+                            bundleId,
+                            opened ? @"YES" : @"NO",
+                            (CFAbsoluteTimeGetCurrent() - startedAt) * 1000.0);
+                    if (opened) {
+                        ok = YES;
+                    } else {
+                        errMsg = @"LSApplicationWorkspace openApplicationWithBundleID: returned NO";
+                    }
+                }
+            }
+        } @catch (NSException *exception) {
+            errMsg = [NSString stringWithFormat:@"LSApplicationWorkspace launch failed: %@",
+                      exception.reason ?: exception.name ?: @"unknown exception"];
+            APP_LOG(@"LaunchServices launch exception for %@: %@ - %@",
+                    bundleId,
+                    exception.name ?: @"unknown",
+                    exception.reason ?: @"-");
+        }
+    } else {
+        errMsg = @"LSApplicationWorkspace is unavailable";
+    }
+
+    // Keep the SpringBoard-private path only as a compatibility fallback.
+    dispatch_block_t fallbackBlock = ^{
         Class SBAppCtrl = objc_getClass("SBApplicationController");
         if (SBAppCtrl) {
             id appCtrl = [SBAppCtrl performSelector:@selector(sharedInstance)];
@@ -785,30 +827,18 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
                 }
             }
         }
-
-        // Method 2: LSApplicationWorkspace openApplicationWithBundleID:
-        Class LSWorkspaceClass = objc_getClass("LSApplicationWorkspace");
-        if (LSWorkspaceClass) {
-            id workspace = [LSWorkspaceClass performSelector:@selector(defaultWorkspace)];
-            SEL openSel = @selector(openApplicationWithBundleID:);
-            if ([workspace respondsToSelector:openSel]) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Warc-performSelector-leaks"
-                [workspace performSelector:openSel withObject:bundleId];
-#pragma clang diagnostic pop
-                APP_LOG(@"Launched app via LSApplicationWorkspace: %@", bundleId);
-                ok = YES;
-                return;
-            }
-        }
-
-        errMsg = [NSString stringWithFormat:@"No launch method available for %@", bundleId];
+        NSString *primaryError = errMsg.length > 0 ? errMsg : @"LaunchServices request failed";
+        errMsg = [NSString stringWithFormat:@"%@; SBUIController fallback unavailable for %@",
+                  primaryError,
+                  bundleId];
     };
 
-    if ([NSThread isMainThread]) {
-        block();
-    } else {
-        dispatch_sync(dispatch_get_main_queue(), block);
+    if (!ok) {
+        if ([NSThread isMainThread]) {
+            fallbackBlock();
+        } else {
+            dispatch_sync(dispatch_get_main_queue(), fallbackBlock);
+        }
     }
 
     if (!ok) {
