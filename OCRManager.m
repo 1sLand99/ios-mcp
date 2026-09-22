@@ -3,6 +3,7 @@
 #import "MCPLogger.h"
 #import <UIKit/UIKit.h>
 #import <Vision/Vision.h>
+#import <ImageIO/ImageIO.h>
 
 #define OCR_LOG(fmt, ...) [MCPLogger log:@"[OCR] " fmt, ##__VA_ARGS__]
 
@@ -22,24 +23,14 @@ static double OCRNum(NSDictionary *d, NSString *k) {
     return [v respondsToSelector:@selector(doubleValue)] ? [v doubleValue] : 0.0;
 }
 
-/// Screen size in points, with long/short edges oriented to match `image`.
-///
-/// UIScreen.bounds follows the current interface orientation, while a framebuffer capture may not,
-/// so the edges are assigned by comparing aspect. Returns CGSizeZero if the screen size is unknown.
-static CGSize OCRPointSizeMatchingImage(UIImage *image) {
-    CGSize screenSize = [UIScreen mainScreen].bounds.size;
-    CGFloat pointLong = MAX(screenSize.width, screenSize.height);
-    CGFloat pointShort = MIN(screenSize.width, screenSize.height);
-    if (pointLong < 1.0 || pointShort < 1.0) return CGSizeZero;
-
-    CGImageRef cgImage = image.CGImage;
-    CGFloat imageWidth = cgImage ? (CGFloat)CGImageGetWidth(cgImage) : image.size.width;
-    CGFloat imageHeight = cgImage ? (CGFloat)CGImageGetHeight(cgImage) : image.size.height;
-    if (imageWidth < 1.0 || imageHeight < 1.0) return CGSizeZero;
-
-    BOOL imageIsLandscape = imageWidth > imageHeight;
-    return imageIsLandscape ? CGSizeMake(pointLong, pointShort)
-                            : CGSizeMake(pointShort, pointLong);
+// Vision should see upright text even though the framebuffer remains in fixed orientation.
+static CGImagePropertyOrientation OCROrientation(UIInterfaceOrientation orientation) {
+    switch (orientation) {
+        case UIInterfaceOrientationLandscapeLeft: return kCGImagePropertyOrientationLeft;
+        case UIInterfaceOrientationLandscapeRight: return kCGImagePropertyOrientationRight;
+        case UIInterfaceOrientationPortraitUpsideDown: return kCGImagePropertyOrientationDown;
+        default: return kCGImagePropertyOrientationUp;
+    }
 }
 
 // Downsample a CGImage so its longest edge is at most maxEdge pixels, via CoreGraphics.
@@ -79,21 +70,16 @@ static CGImageRef OCRCreateDownsampled(CGImageRef src, CGFloat maxEdge) CF_RETUR
     if (error) *error = nil;
 
     if (@available(iOS 13.0, *)) {
-        UIImage *image = [[ScreenManager sharedInstance] captureScreenImage];
+        MCPScreenGeometry geometry;
+        UIImage *image = [[ScreenManager sharedInstance] captureScreenImageWithGeometry:&geometry];
         if (!image || !image.CGImage) {
             if (error) *error = @"Failed to capture screen for OCR";
             return nil;
         }
 
-        // Recognition runs on the full-resolution capture (small text needs the pixels), but every
-        // rect/tap is reported in screen points so it is tap_screen-ready.
-        //
-        // image.size is deliberately not used here: it is pixelSize / image.scale, and the capture
-        // paths tag images with UIScreen.scale. Under Display Zoom the framebuffer is rendered at
-        // nativeScale instead, so that division does not land on the point size. Deriving the size
-        // from UIScreen.bounds is exact by definition. Long/short edges are matched because the
-        // capture does not necessarily share bounds' orientation.
-        CGSize pointSize = OCRPointSizeMatchingImage(image);
+        // Vision's oriented image uses interface coordinates. Public regions/results use fixed
+        // screenshot points. Do not derive either from UIImage.scale (Display Zoom differs).
+        CGSize pointSize = geometry.interfaceBounds.size;
         CGFloat W = pointSize.width;
         CGFloat H = pointSize.height;
         if (W < 1.0 || H < 1.0) {
@@ -124,6 +110,10 @@ static CGImageRef OCRCreateDownsampled(CGImageRef src, CGFloat maxEdge) CF_RETUR
             double rx = OCRNum(region, @"x"), ry = OCRNum(region, @"y");
             double rw = OCRNum(region, @"width"), rh = OCRNum(region, @"height");
             if (rw > 0 && rh > 0) {
+                CGRect orientedRegion = CGRectApplyAffineTransform(CGRectMake(rx, ry, rw, rh),
+                                                 CGAffineTransformInvert(geometry.interfaceToFixed));
+                rx = orientedRegion.origin.x; ry = orientedRegion.origin.y;
+                rw = orientedRegion.size.width; rh = orientedRegion.size.height;
                 // Clamp in point space first, so the normalized rect cannot extend past the edges
                 // (origin + size > 1 leaves Vision's behaviour and the reverse mapping undefined).
                 double left = MAX(0.0, MIN(rx, W));
@@ -141,12 +131,14 @@ static CGImageRef OCRCreateDownsampled(CGImageRef src, CGFloat maxEdge) CF_RETUR
         }
 
         // Downsample large captures before OCR (longest edge cap). Speeds up Vision on
-        // high-res iPad screens; coordinates still map back via the logical image.size.
+        // high-res iPad screens; coordinates still map back via the captured screen geometry.
         CGImageRef ocrImage = image.CGImage;
         CGImageRef downsampled = OCRCreateDownsampled(image.CGImage, 1600.0);
         if (downsampled) ocrImage = downsampled;
 
-        VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:ocrImage options:@{}];
+        CGImagePropertyOrientation orientation = OCROrientation(geometry.interfaceOrientation);
+        VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:ocrImage
+                                                                         orientation:orientation options:@{}];
         NSError *performError = nil;
         BOOL ok = [handler performRequests:@[request] error:&performError];
 
@@ -165,7 +157,8 @@ static CGImageRef OCRCreateDownsampled(CGImageRef src, CGFloat maxEdge) CF_RETUR
             fastReq.usesLanguageCorrection = NO;
             fastReq.recognitionLanguages = request.recognitionLanguages;
             fastReq.regionOfInterest = request.regionOfInterest;
-            VNImageRequestHandler *h2 = [[VNImageRequestHandler alloc] initWithCGImage:ocrImage options:@{}];
+            VNImageRequestHandler *h2 = [[VNImageRequestHandler alloc] initWithCGImage:ocrImage
+                                                                        orientation:orientation options:@{}];
             performError = nil;
             ok = [h2 performRequests:@[fastReq] error:&performError];
         }
@@ -202,8 +195,9 @@ static CGImageRef OCRCreateDownsampled(CGImageRef src, CGFloat maxEdge) CF_RETUR
             double h = fh * H;
             double y = (1.0 - fy - fh) * H; // flip Y to top-left origin
 
-            int ix = (int)round(x), iy = (int)round(y);
-            int iw = (int)round(w), ih = (int)round(h);
+            CGRect fixedRect = CGRectApplyAffineTransform(CGRectMake(x, y, w, h), geometry.interfaceToFixed);
+            int ix = (int)round(fixedRect.origin.x), iy = (int)round(fixedRect.origin.y);
+            int iw = (int)round(fixedRect.size.width), ih = (int)round(fixedRect.size.height);
 
             [texts addObject:@{
                 @"text": str,
@@ -217,7 +211,9 @@ static CGImageRef OCRCreateDownsampled(CGImageRef src, CGFloat maxEdge) CF_RETUR
         return @{
             @"texts": texts,
             @"count": @(texts.count),
-            @"screen": @{@"width": @((int)round(W)), @"height": @((int)round(H))}
+            @"screen": @{@"width": @((int)round(geometry.fixedBounds.size.width)),
+                         @"height": @((int)round(geometry.fixedBounds.size.height)),
+                         @"coordinate_space": @"fixed"}
         };
     }
 

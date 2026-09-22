@@ -31,7 +31,7 @@
 #define MCP_PROTOCOL_VERSION_LATEST @"2025-11-25"
 #define MCP_PROTOCOL_VERSION_LEGACY @"2025-03-26"
 #define MCP_SERVER_NAME             @"ios-mcp"
-#define MCP_SERVER_VERSION          @"1.2.5"
+#define MCP_SERVER_VERSION          @"1.2.6"
 #define HTTP_BUF_SIZE        (256 * 1024)
 #define MCP_MAX_CHUNK_LINE   (8 * 1024)
 #define MCP_UPLOAD_DIR       @"/var/mobile/Library/Caches/ios-mcp-uploads"

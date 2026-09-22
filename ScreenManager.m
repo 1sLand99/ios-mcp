@@ -27,6 +27,41 @@ static const CGFloat kMCPScreenshotInitialJPEGQuality = 0.82;
 static const CGFloat kMCPScreenshotMinimumJPEGQuality = 0.30;
 static const NSInteger kMCPScreenshotJPEGSearchPasses = 6;
 
+MCPScreenGeometry MCPGetScreenGeometry(void) {
+    __block MCPScreenGeometry geometry;
+    dispatch_block_t read = ^{
+        UIScreen *screen = UIScreen.mainScreen;
+        id<UICoordinateSpace> current = screen.coordinateSpace;
+        id<UICoordinateSpace> fixed = screen.fixedCoordinateSpace;
+        CGPoint origin = [fixed convertPoint:CGPointZero fromCoordinateSpace:current];
+        CGPoint x = [fixed convertPoint:CGPointMake(1, 0) fromCoordinateSpace:current];
+        CGPoint y = [fixed convertPoint:CGPointMake(0, 1) fromCoordinateSpace:current];
+        CGAffineTransform transform = CGAffineTransformMake(x.x - origin.x, x.y - origin.y,
+                                                          y.x - origin.x, y.y - origin.y,
+                                                          origin.x, origin.y);
+        // SpringBoard's own scene can stay portrait while the foreground app rotates. Use the
+        // actual screen-space transform, including 180-degree rotation, instead of that scene.
+        UIInterfaceOrientation orientation = UIInterfaceOrientationPortrait;
+        if (transform.b > 0.5) orientation = UIInterfaceOrientationLandscapeLeft;
+        else if (transform.b < -0.5) orientation = UIInterfaceOrientationLandscapeRight;
+        else if (transform.a < -0.5) orientation = UIInterfaceOrientationPortraitUpsideDown;
+        geometry = (MCPScreenGeometry){fixed.bounds, current.bounds, transform, orientation};
+    };
+    if (NSThread.isMainThread) read();
+    else dispatch_sync(dispatch_get_main_queue(), read);
+    return geometry;
+}
+
+NSString *MCPInterfaceOrientationName(UIInterfaceOrientation orientation) {
+    switch (orientation) {
+        case UIInterfaceOrientationPortrait: return @"portrait";
+        case UIInterfaceOrientationPortraitUpsideDown: return @"portrait_upside_down";
+        case UIInterfaceOrientationLandscapeLeft: return @"landscape_left";
+        case UIInterfaceOrientationLandscapeRight: return @"landscape_right";
+        default: return @"unknown";
+    }
+}
+
 /// Point-space target size for a pixel-space capture of `pixelSize`.
 ///
 /// Screenshots are downsampled so that one image pixel equals one screen point, which makes the
@@ -38,7 +73,7 @@ static const NSInteger kMCPScreenshotJPEGSearchPasses = 6;
 static CGSize MCPPointSizeForPixelSize(CGSize pixelSize) {
     if (pixelSize.width < 1.0 || pixelSize.height < 1.0) return CGSizeZero;
 
-    CGSize screenSize = [UIScreen mainScreen].bounds.size;
+    CGSize screenSize = [UIScreen mainScreen].fixedCoordinateSpace.bounds.size;
     CGFloat pointLongEdge = MAX(screenSize.width, screenSize.height);
     if (pointLongEdge < 1.0) return CGSizeZero;
 
@@ -113,33 +148,13 @@ __attribute__((constructor)) static void _resolveScreenImageFunc(void) {
     __block NSDictionary *info;
     dispatch_block_t block = ^{
         UIScreen *screen = [UIScreen mainScreen];
-        CGRect bounds = screen.bounds;
+        MCPScreenGeometry geometry = MCPGetScreenGeometry();
+        CGRect bounds = geometry.fixedBounds;
         CGFloat scale = screen.scale;
         // nativeScale differs from scale under Display Zoom; the framebuffer follows nativeScale.
         CGFloat pixelScale = screen.nativeScale > 0 ? screen.nativeScale : scale;
 
-        NSString *orientationStr;
-        UIInterfaceOrientation orientation;
-        if (@available(iOS 13.0, *)) {
-            UIWindowScene *scene = nil;
-            for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
-                if ([s isKindOfClass:[UIWindowScene class]]) {
-                    scene = (UIWindowScene *)s;
-                    break;
-                }
-            }
-            orientation = scene ? scene.interfaceOrientation : UIInterfaceOrientationPortrait;
-        } else {
-            orientation = [UIApplication sharedApplication].statusBarOrientation;
-        }
-
-        switch (orientation) {
-            case UIInterfaceOrientationPortrait:           orientationStr = @"portrait"; break;
-            case UIInterfaceOrientationPortraitUpsideDown: orientationStr = @"portrait_upside_down"; break;
-            case UIInterfaceOrientationLandscapeLeft:      orientationStr = @"landscape_left"; break;
-            case UIInterfaceOrientationLandscapeRight:     orientationStr = @"landscape_right"; break;
-            default:                                       orientationStr = @"unknown"; break;
-        }
+        NSString *orientationStr = MCPInterfaceOrientationName(geometry.interfaceOrientation);
 
         NSDictionary *interactionState = [self deviceInteractionStateOnMainThread];
         NSMutableDictionary *result = [@{
@@ -150,7 +165,8 @@ __attribute__((constructor)) static void _resolveScreenImageFunc(void) {
             @"pixel_width": @(round(bounds.size.width * pixelScale)),
             @"pixel_height":@(round(bounds.size.height * pixelScale)),
             @"orientation": orientationStr,
-            @"coordinate_space_hint": @"width/height are screen points — the coordinate space used by "
+            @"coordinate_space": @"fixed",
+            @"coordinate_space_hint": @"width/height are fixed screen points, independent of interface orientation — the coordinate space used by "
                                       @"tap_screen, swipe_screen, long_press, double_tap and drag_and_drop. "
                                       @"The screenshot tool already returns point-sized images, so "
                                       @"coordinates read off a screenshot are used directly, without "
@@ -398,8 +414,13 @@ __attribute__((constructor)) static void _resolveScreenImageFunc(void) {
 }
 
 - (UIImage *)captureScreenImage {
+    return [self captureScreenImageWithGeometry:NULL];
+}
+
+- (UIImage *)captureScreenImageWithGeometry:(MCPScreenGeometry *)geometry {
     __block UIImage *image = nil;
     dispatch_block_t block = ^{
+        if (geometry) *geometry = MCPGetScreenGeometry();
         image = [self privateScreenshotImage];
         if (!image) {
             image = [self fallbackScreenshotImage];
@@ -522,8 +543,16 @@ __attribute__((constructor)) static void _resolveScreenImageFunc(void) {
 
     UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat defaultFormat];
     format.scale = [UIScreen mainScreen].scale;
-    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:keyWindow.bounds.size format:format];
+    id<UICoordinateSpace> fixed = keyWindow.screen.fixedCoordinateSpace;
+    CGPoint origin = [keyWindow convertPoint:CGPointZero toCoordinateSpace:fixed];
+    CGPoint x = [keyWindow convertPoint:CGPointMake(1, 0) toCoordinateSpace:fixed];
+    CGPoint y = [keyWindow convertPoint:CGPointMake(0, 1) toCoordinateSpace:fixed];
+    CGAffineTransform windowToFixed = CGAffineTransformMake(x.x - origin.x, x.y - origin.y,
+                                                           y.x - origin.x, y.y - origin.y,
+                                                           origin.x, origin.y);
+    UIGraphicsImageRenderer *renderer = [[UIGraphicsImageRenderer alloc] initWithSize:fixed.bounds.size format:format];
     UIImage *image = [renderer imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+        CGContextConcatCTM(ctx.CGContext, windowToFixed);
         [keyWindow drawViewHierarchyInRect:keyWindow.bounds afterScreenUpdates:NO];
     }];
     return image;
