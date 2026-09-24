@@ -3,6 +3,8 @@
 #import "MCPLogger.h"
 #import <UIKit/UIKit.h>
 #import <Vision/Vision.h>
+#import <ImageIO/ImageIO.h>
+#import <math.h>
 
 #define OCR_LOG(fmt, ...) [MCPLogger log:@"[OCR] " fmt, ##__VA_ARGS__]
 
@@ -17,29 +19,90 @@
     return instance;
 }
 
-static double OCRNum(NSDictionary *d, NSString *k) {
-    id v = d[k];
-    return [v respondsToSelector:@selector(doubleValue)] ? [v doubleValue] : 0.0;
+static BOOL OCRParseRegion(NSDictionary *region, CGRect *outRect, NSString **error) {
+    if (error) *error = nil;
+    if (!region) return YES;
+    if (![region isKindOfClass:[NSDictionary class]]) {
+        if (error) *error = @"Invalid region: expected an object with x, y, width and height";
+        return NO;
+    }
+    NSArray<NSString *> *keys = @[@"x", @"y", @"width", @"height"];
+    double values[4];
+    for (NSUInteger i = 0; i < keys.count; i++) {
+        id value = region[keys[i]];
+        if (![value isKindOfClass:[NSNumber class]] ||
+            CFGetTypeID((__bridge CFTypeRef)value) == CFBooleanGetTypeID() ||
+            !isfinite([value doubleValue])) {
+            if (error) *error = [NSString stringWithFormat:@"Invalid region.%@: expected a finite number", keys[i]];
+            return NO;
+        }
+        values[i] = [value doubleValue];
+    }
+    if (values[2] <= 0 || values[3] <= 0) {
+        if (error) *error = @"Invalid region: width and height must be greater than 0";
+        return NO;
+    }
+    if (!isfinite(values[0] + values[2]) || !isfinite(values[1] + values[3])) {
+        if (error) *error = @"Invalid region: x + width and y + height must be finite";
+        return NO;
+    }
+    if (outRect) *outRect = CGRectMake(values[0], values[1], values[2], values[3]);
+    return YES;
 }
 
-/// Screen size in points, with long/short edges oriented to match `image`.
-///
-/// UIScreen.bounds follows the current interface orientation, while a framebuffer capture may not,
-/// so the edges are assigned by comparing aspect. Returns CGSizeZero if the screen size is unknown.
-static CGSize OCRPointSizeMatchingImage(UIImage *image) {
-    CGSize screenSize = [UIScreen mainScreen].bounds.size;
-    CGFloat pointLong = MAX(screenSize.width, screenSize.height);
-    CGFloat pointShort = MIN(screenSize.width, screenSize.height);
-    if (pointLong < 1.0 || pointShort < 1.0) return CGSizeZero;
++ (BOOL)validateRegion:(NSDictionary *)region error:(NSString **)error {
+    return OCRParseRegion(region, NULL, error);
+}
 
-    CGImageRef cgImage = image.CGImage;
-    CGFloat imageWidth = cgImage ? (CGFloat)CGImageGetWidth(cgImage) : image.size.width;
-    CGFloat imageHeight = cgImage ? (CGFloat)CGImageGetHeight(cgImage) : image.size.height;
-    if (imageWidth < 1.0 || imageHeight < 1.0) return CGSizeZero;
+static NSArray<NSString *> *OCRSupportedLanguages(VNRecognizeTextRequest *request, NSError **error) API_AVAILABLE(ios(13.0)) {
+    if (@available(iOS 15.0, *)) {
+        return [request supportedRecognitionLanguagesAndReturnError:error];
+    }
+    return [VNRecognizeTextRequest supportedRecognitionLanguagesForTextRecognitionLevel:request.recognitionLevel
+                                                                               revision:request.revision error:error];
+}
 
-    BOOL imageIsLandscape = imageWidth > imageHeight;
-    return imageIsLandscape ? CGSizeMake(pointLong, pointShort)
-                            : CGSizeMake(pointShort, pointLong);
+// Preserve priority order. Accept case/underscore variations and bare language codes such as
+// "en", but never silently drop an unsupported language (notably Chinese in the fast path).
+static NSArray<NSString *> *OCRResolveLanguages(NSArray<NSString *> *languages, NSArray<NSString *> *supported) {
+    NSMutableArray *resolved = [NSMutableArray array];
+    for (NSString *language in languages) {
+        NSString *tag = [language stringByReplacingOccurrencesOfString:@"_" withString:@"-"];
+        NSString *match = nil;
+        for (NSString *candidate in supported) {
+            if ([tag caseInsensitiveCompare:candidate] == NSOrderedSame) { match = candidate; break; }
+        }
+        if (!match && tag.length && ![tag containsString:@"-"]) {
+            NSString *prefix = [[tag lowercaseString] stringByAppendingString:@"-"];
+            for (NSString *candidate in supported) {
+                if ([[candidate lowercaseString] hasPrefix:prefix]) { match = candidate; break; }
+            }
+        }
+        if (!match) return nil;
+        if (![resolved containsObject:match]) [resolved addObject:match];
+    }
+    return resolved;
+}
+
+static NSString *OCRErrorDescription(NSError *error) {
+    NSMutableArray *parts = [NSMutableArray array];
+    // Keep the Core ML cause, not just Vision's generic "internal error" message.
+    for (NSUInteger depth = 0; error && depth < 4; depth++) {
+        [parts addObject:[NSString stringWithFormat:@"%@ (%@:%ld)", error.localizedDescription,
+                          error.domain, (long)error.code]];
+        error = error.userInfo[NSUnderlyingErrorKey];
+    }
+    return parts.count ? [parts componentsJoinedByString:@"; "] : @"Vision OCR failed";
+}
+
+// Vision should see upright text even though the framebuffer remains in fixed orientation.
+static CGImagePropertyOrientation OCROrientation(UIInterfaceOrientation orientation) {
+    switch (orientation) {
+        case UIInterfaceOrientationLandscapeLeft: return kCGImagePropertyOrientationLeft;
+        case UIInterfaceOrientationLandscapeRight: return kCGImagePropertyOrientationRight;
+        case UIInterfaceOrientationPortraitUpsideDown: return kCGImagePropertyOrientationDown;
+        default: return kCGImagePropertyOrientationUp;
+    }
 }
 
 // Downsample a CGImage so its longest edge is at most maxEdge pixels, via CoreGraphics.
@@ -77,23 +140,20 @@ static CGImageRef OCRCreateDownsampled(CGImageRef src, CGFloat maxEdge) CF_RETUR
                                         fast:(BOOL)fast
                                        error:(NSString **)error {
     if (error) *error = nil;
+    CGRect requestedRegion = CGRectZero;
+    if (!OCRParseRegion(region, &requestedRegion, error)) return nil;
 
     if (@available(iOS 13.0, *)) {
-        UIImage *image = [[ScreenManager sharedInstance] captureScreenImage];
+        MCPScreenGeometry geometry;
+        UIImage *image = [[ScreenManager sharedInstance] captureScreenImageWithGeometry:&geometry];
         if (!image || !image.CGImage) {
             if (error) *error = @"Failed to capture screen for OCR";
             return nil;
         }
 
-        // Recognition runs on the full-resolution capture (small text needs the pixels), but every
-        // rect/tap is reported in screen points so it is tap_screen-ready.
-        //
-        // image.size is deliberately not used here: it is pixelSize / image.scale, and the capture
-        // paths tag images with UIScreen.scale. Under Display Zoom the framebuffer is rendered at
-        // nativeScale instead, so that division does not land on the point size. Deriving the size
-        // from UIScreen.bounds is exact by definition. Long/short edges are matched because the
-        // capture does not necessarily share bounds' orientation.
-        CGSize pointSize = OCRPointSizeMatchingImage(image);
+        // Vision's oriented image uses interface coordinates. Public regions/results use fixed
+        // screenshot points. Do not derive either from UIImage.scale (Display Zoom differs).
+        CGSize pointSize = geometry.interfaceBounds.size;
         CGFloat W = pointSize.width;
         CGFloat H = pointSize.height;
         if (W < 1.0 || H < 1.0) {
@@ -109,70 +169,86 @@ static CGImageRef OCRCreateDownsampled(CGImageRef src, CGFloat maxEdge) CF_RETUR
             observations = (NSArray<VNRecognizedTextObservation *> *)req.results;
         }];
         request.recognitionLevel = fast ? VNRequestTextRecognitionLevelFast : VNRequestTextRecognitionLevelAccurate;
-        request.usesLanguageCorrection = !fast; // fast 模式跳过语言矫正以最大化速度
-        if (languages.count > 0) {
-            request.recognitionLanguages = languages;
-        } else {
-            request.recognitionLanguages = @[@"zh-Hans", @"en-US"];
+        NSArray *requestedLanguages = languages.count ? languages : @[@"zh-Hans", @"en-US"];
+        NSMutableArray *adjustments = [NSMutableArray array];
+        NSError *languageError = nil;
+        NSArray *supported = OCRSupportedLanguages(request, &languageError);
+        NSArray *resolved = supported ? OCRResolveLanguages(requestedLanguages, supported) : nil;
+        if (supported && !resolved && fast) {
+            // fast is a speed preference, not permission to switch to a Latin-only recognizer.
+            request.recognitionLevel = VNRequestTextRecognitionLevelAccurate;
+            languageError = nil;
+            supported = OCRSupportedLanguages(request, &languageError);
+            resolved = supported ? OCRResolveLanguages(requestedLanguages, supported) : nil;
+            [adjustments addObject:@"fast_unsupported_languages"];
         }
+        if (!resolved) {
+            if (error) *error = languageError ? OCRErrorDescription(languageError) :
+                [NSString stringWithFormat:@"OCR languages %@ are not supported by Vision revision %lu on this device. Supported languages: %@",
+                 requestedLanguages, (unsigned long)request.revision, supported ?: @[]];
+            return nil;
+        }
+        request.recognitionLanguages = resolved;
+        request.usesLanguageCorrection = request.recognitionLevel == VNRequestTextRecognitionLevelAccurate;
+        // Run accurate recognition on CPU from the first attempt. This avoids the failing
+        // default compute path seen on some devices without changing language/model support.
+        request.usesCPUOnly = request.recognitionLevel == VNRequestTextRecognitionLevelAccurate;
+
+        NSDictionary *recognition = @{
+            @"requested_level": fast ? @"fast" : @"accurate",
+            @"level": request.recognitionLevel == VNRequestTextRecognitionLevelFast ? @"fast" : @"accurate",
+            @"languages": request.recognitionLanguages,
+            @"revision": @(request.revision),
+            @"uses_cpu_only": @(request.usesCPUOnly),
+            @"adjustments": adjustments
+        };
+        NSDictionary *screen = @{@"width": @((int)round(geometry.fixedBounds.size.width)),
+                                 @"height": @((int)round(geometry.fixedBounds.size.height)),
+                                 @"coordinate_space": @"fixed"};
 
         // Limit OCR to a region of interest if provided (Vision uses normalized, origin bottom-left).
         // The ROI is kept so observation boxes, which Vision normalizes against the ROI rather than
         // the full image, can be mapped back to full-image space below.
         CGRect roi = CGRectMake(0, 0, 1, 1);
-        if ([region isKindOfClass:[NSDictionary class]] && region.count > 0) {
-            double rx = OCRNum(region, @"x"), ry = OCRNum(region, @"y");
-            double rw = OCRNum(region, @"width"), rh = OCRNum(region, @"height");
-            if (rw > 0 && rh > 0) {
-                // Clamp in point space first, so the normalized rect cannot extend past the edges
-                // (origin + size > 1 leaves Vision's behaviour and the reverse mapping undefined).
-                double left = MAX(0.0, MIN(rx, W));
-                double top = MAX(0.0, MIN(ry, H));
-                double right = MAX(left, MIN(rx + rw, W));
-                double bottom = MAX(top, MIN(ry + rh, H));
-                if (right > left && bottom > top) {
-                    roi = CGRectMake(left / W,
-                                     (H - bottom) / H,  // flip Y to bottom-left origin
-                                     (right - left) / W,
-                                     (bottom - top) / H);
-                    request.regionOfInterest = roi;
-                }
+        if (region) {
+            // Clip before rotating so even very large finite inputs cannot overflow the transform.
+            CGRect clippedRegion = CGRectIntersection(requestedRegion, geometry.fixedBounds);
+            if (CGRectIsNull(clippedRegion) || CGRectIsEmpty(clippedRegion)) {
+                // Do not leave Vision's default full-screen ROI in place for an empty intersection.
+                OCR_LOG(@"empty region: no intersection with screen");
+                return @{@"texts": @[], @"count": @0, @"recognition": recognition, @"screen": screen};
             }
+            CGRect orientedRegion = CGRectApplyAffineTransform(clippedRegion,
+                                             CGAffineTransformInvert(geometry.interfaceToFixed));
+            double left = MAX(0.0, MIN(CGRectGetMinX(orientedRegion), W));
+            double top = MAX(0.0, MIN(CGRectGetMinY(orientedRegion), H));
+            double right = MAX(left, MIN(CGRectGetMaxX(orientedRegion), W));
+            double bottom = MAX(top, MIN(CGRectGetMaxY(orientedRegion), H));
+            if (right <= left || bottom <= top) {
+                return @{@"texts": @[], @"count": @0, @"recognition": recognition, @"screen": screen};
+            }
+            roi = CGRectMake(left / W,
+                             (H - bottom) / H,  // flip Y to bottom-left origin
+                             (right - left) / W,
+                             (bottom - top) / H);
+            request.regionOfInterest = roi;
         }
 
         // Downsample large captures before OCR (longest edge cap). Speeds up Vision on
-        // high-res iPad screens; coordinates still map back via the logical image.size.
+        // high-res iPad screens; coordinates still map back via the captured screen geometry.
         CGImageRef ocrImage = image.CGImage;
         CGImageRef downsampled = OCRCreateDownsampled(image.CGImage, 1600.0);
         if (downsampled) ocrImage = downsampled;
 
-        VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:ocrImage options:@{}];
+        CGImagePropertyOrientation orientation = OCROrientation(geometry.interfaceOrientation);
+        VNImageRequestHandler *handler = [[VNImageRequestHandler alloc] initWithCGImage:ocrImage
+                                                                         orientation:orientation options:@{}];
         NSError *performError = nil;
         BOOL ok = [handler performRequests:@[request] error:&performError];
 
-        // iOS 14's Vision can fail the accurate recognition level with an internal error
-        // ("VNRecognizeTextRequest produced an internal error"). Fall back to the fast level
-        // once so OCR still returns results instead of failing outright.
-        if ((!ok || visionError) && !fast) {
-            OCR_LOG(@"accurate failed (%@), retrying with fast level",
-                    (performError ?: visionError).localizedDescription ?: @"?");
-            observations = nil; visionError = nil;
-            VNRecognizeTextRequest *fastReq = [[VNRecognizeTextRequest alloc] initWithCompletionHandler:^(VNRequest *req, NSError *err) {
-                visionError = err;
-                observations = (NSArray<VNRecognizedTextObservation *> *)req.results;
-            }];
-            fastReq.recognitionLevel = VNRequestTextRecognitionLevelFast;
-            fastReq.usesLanguageCorrection = NO;
-            fastReq.recognitionLanguages = request.recognitionLanguages;
-            fastReq.regionOfInterest = request.regionOfInterest;
-            VNImageRequestHandler *h2 = [[VNImageRequestHandler alloc] initWithCGImage:ocrImage options:@{}];
-            performError = nil;
-            ok = [h2 performRequests:@[fastReq] error:&performError];
-        }
-
         if (downsampled) CGImageRelease(downsampled);
         if (!ok || visionError) {
-            NSString *msg = (performError ?: visionError).localizedDescription ?: @"Vision OCR failed";
+            NSString *msg = OCRErrorDescription(performError ?: visionError);
             if (error) *error = msg;
             OCR_LOG(@"failed: %@", msg);
             return nil;
@@ -202,8 +278,9 @@ static CGImageRef OCRCreateDownsampled(CGImageRef src, CGFloat maxEdge) CF_RETUR
             double h = fh * H;
             double y = (1.0 - fy - fh) * H; // flip Y to top-left origin
 
-            int ix = (int)round(x), iy = (int)round(y);
-            int iw = (int)round(w), ih = (int)round(h);
+            CGRect fixedRect = CGRectApplyAffineTransform(CGRectMake(x, y, w, h), geometry.interfaceToFixed);
+            int ix = (int)round(fixedRect.origin.x), iy = (int)round(fixedRect.origin.y);
+            int iw = (int)round(fixedRect.size.width), ih = (int)round(fixedRect.size.height);
 
             [texts addObject:@{
                 @"text": str,
@@ -213,11 +290,12 @@ static CGImageRef OCRCreateDownsampled(CGImageRef src, CGFloat maxEdge) CF_RETUR
             }];
         }
 
-        OCR_LOG(@"ok count=%lu langs=%@", (unsigned long)texts.count, request.recognitionLanguages);
+        OCR_LOG(@"ok count=%lu recognition=%@", (unsigned long)texts.count, recognition);
         return @{
             @"texts": texts,
             @"count": @(texts.count),
-            @"screen": @{@"width": @((int)round(W)), @"height": @((int)round(H))}
+            @"recognition": recognition,
+            @"screen": screen
         };
     }
 

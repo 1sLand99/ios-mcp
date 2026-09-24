@@ -1,4 +1,5 @@
 #import "MCPAXNodeSource.h"
+#import "ScreenManager.h"
 #import "MCPAXAttributeBridge.h"
 #import "AXPrivate.h"
 #import <UIKit/UIKit.h>
@@ -876,6 +877,41 @@ static CGFloat MCPAXNodeFrameArea(NSDictionary *frame) {
 static NSInteger MCPAXNodeNumericFallbackMaxElements(NSInteger requestedMaxElements) {
     if (requestedMaxElements <= 0) return 50;
     return MIN(requestedMaxElements, 2000);
+}
+
+// AX attribute frames/clipping use interface coordinates, while native AX hit-test APIs take
+// fixed display points. Convert attribute results exactly once at the public boundary.
+static id MCPAXNodeResultInFixedCoordinates(id value, CGAffineTransform transform) {
+    if ([value isKindOfClass:NSArray.class]) {
+        NSMutableArray *result = [NSMutableArray arrayWithCapacity:[value count]];
+        for (id child in value) [result addObject:MCPAXNodeResultInFixedCoordinates(child, transform)];
+        return result;
+    }
+    if (![value isKindOfClass:NSDictionary.class]) return value;
+    NSMutableDictionary *result = [value mutableCopy];
+    for (NSString *key in value) {
+        id child = value[key];
+        BOOL rectKey = [@[@"rect", @"visible_rect", @"frame", @"visibleFrame", @"focusable_frame_for_zoom"] containsObject:key];
+        BOOL pointKey = [@[@"tap", @"center_point", @"visible_point", @"hit_test_point", @"samplePoint"] containsObject:key];
+        if ((rectKey || pointKey) && [child isKindOfClass:NSDictionary.class] &&
+            [child[@"x"] isKindOfClass:NSNumber.class] && [child[@"y"] isKindOfClass:NSNumber.class]) {
+            NSMutableDictionary *converted = [child mutableCopy];
+            if (rectKey && [child[@"width"] isKindOfClass:NSNumber.class] && [child[@"height"] isKindOfClass:NSNumber.class]) {
+                CGRect rect = CGRectMake([child[@"x"] doubleValue], [child[@"y"] doubleValue],
+                                         [child[@"width"] doubleValue], [child[@"height"] doubleValue]);
+                rect = CGRectApplyAffineTransform(rect, transform);
+                converted[@"x"] = @(rect.origin.x); converted[@"y"] = @(rect.origin.y);
+                converted[@"width"] = @(rect.size.width); converted[@"height"] = @(rect.size.height);
+            } else if (pointKey) {
+                CGPoint point = CGPointApplyAffineTransform(CGPointMake([child[@"x"] doubleValue], [child[@"y"] doubleValue]), transform);
+                converted[@"x"] = @(point.x); converted[@"y"] = @(point.y);
+            }
+            result[key] = converted;
+        } else {
+            result[key] = MCPAXNodeResultInFixedCoordinates(child, transform);
+        }
+    }
+    return result;
 }
 
 static CGRect MCPAXNodeScreenBounds(void) {
@@ -1780,7 +1816,7 @@ static NSDictionary *MCPAXNodeUserTestingSnapshotSummary(NSDictionary *snapshot)
     return self;
 }
 
-- (NSDictionary * _Nullable)elementAtPoint:(CGPoint)point
+- (NSDictionary * _Nullable)elementAtPoint:(CGPoint)fixedPoint
                                        pid:(pid_t)pid
                                   contextId:(uint32_t)contextId
                                   displayId:(uint32_t)displayId
@@ -1790,6 +1826,8 @@ static NSDictionary *MCPAXNodeUserTestingSnapshotSummary(NSDictionary *snapshot)
     __block NSString *resultError = nil;
 
     [self.attributeBridge performOnMainThreadSync:^{
+        MCPScreenGeometry geometry = MCPGetScreenGeometry();
+        CGPoint point = CGPointApplyAffineTransform(fixedPoint, CGAffineTransformInvert(geometry.interfaceToFixed));
         @try {
             if (![self.attributeBridge ensureRuntimeAvailable:&resultError]) {
                 return;
@@ -1805,13 +1843,13 @@ static NSDictionary *MCPAXNodeUserTestingSnapshotSummary(NSDictionary *snapshot)
                 @"parameterized_then_copyElementAtPosition" :
                 @"copyElementAtPosition";
             BOOL skipSlowContextChain = NO;
-            AXUIElementRef hitElement = [self.attributeBridge copyHitTestElementAtPoint:point
+            AXUIElementRef hitElement = [self.attributeBridge copyHitTestElementAtPoint:fixedPoint
                                                                             expectedPid:pid
                                                                      allowParameterized:allowParameterizedHitTest
                                                                                   error:&hitError];
             if (!hitElement) {
                 if (contextId > 0) {
-                    hitElement = [self.attributeBridge copyElementAtPoint:point
+                    hitElement = [self.attributeBridge copyElementAtPoint:fixedPoint
                                                        usingKnownContextId:contextId
                                                                expectedPid:pid
                                                                diagnostics:&hitDiagnostics
@@ -1842,7 +1880,7 @@ static NSDictionary *MCPAXNodeUserTestingSnapshotSummary(NSDictionary *snapshot)
                     }
 
                     if (!hitElement && !skipSlowContextChain) {
-                        hitElement = [self.attributeBridge copyContextChainHitElementAtPoint:point
+                        hitElement = [self.attributeBridge copyContextChainHitElementAtPoint:fixedPoint
                                                                                  expectedPid:pid
                                                                                  diagnostics:&hitDiagnostics
                                                                                        error:&contextChainError];
@@ -1979,6 +2017,8 @@ static NSDictionary *MCPAXNodeUserTestingSnapshotSummary(NSDictionary *snapshot)
         } @catch (NSException *exception) {
             resultError = [NSString stringWithFormat:@"AX hit-test exception: %@: %@", exception.name, exception.reason ?: @"<no reason>"];
             MCP_AX_NODE_LOG(@"Hit-test exception for PID %d: %@: %@", pid, exception.name, exception.reason ?: @"<no reason>");
+        } @finally {
+            resultElement = MCPAXNodeResultInFixedCoordinates(resultElement, geometry.interfaceToFixed);
         }
     }];
 
@@ -2573,7 +2613,8 @@ static NSDictionary *MCPAXNodeUserTestingSnapshotSummary(NSDictionary *snapshot)
 
                     CGPoint point = pointValue.CGPointValue;
                     NSString *hitError = nil;
-                    AXUIElementRef hitElement = [self.attributeBridge copyHitTestElementAtPoint:point
+                    CGPoint fixedSample = CGPointApplyAffineTransform(point, MCPGetScreenGeometry().interfaceToFixed);
+                    AXUIElementRef hitElement = [self.attributeBridge copyHitTestElementAtPoint:fixedSample
                                                                                     expectedPid:pid
                                                                              allowParameterized:YES
                                                                                           error:&hitError];
@@ -2614,7 +2655,11 @@ static NSDictionary *MCPAXNodeUserTestingSnapshotSummary(NSDictionary *snapshot)
             payload[@"format"] = @"compact";
             payload[@"source"] = @"direct_ax_compact_attribute_crawl";
             payload[@"direct_ax_strategy"] = @"compact_numeric_candidate_arrays_sampled_hits";
-            payload[@"screen"] = MCPAXNodeCompactScreenDictionary(screenBounds);
+            MCPScreenGeometry geometry = MCPGetScreenGeometry();
+            NSMutableDictionary *screen = [MCPAXNodeCompactScreenDictionary(geometry.fixedBounds) mutableCopy];
+            screen[@"coordinate_space"] = @"fixed";
+            screen[@"orientation"] = MCPInterfaceOrientationName(geometry.interfaceOrientation);
+            payload[@"screen"] = screen;
             payload[@"visible_only"] = @(visibleOnly);
             payload[@"clickable_only"] = @(clickableOnly);
             payload[@"count"] = @(elements.count);
@@ -2631,7 +2676,7 @@ static NSDictionary *MCPAXNodeUserTestingSnapshotSummary(NSDictionary *snapshot)
             if (displayId > 0) payload[@"displayId"] = @(displayId);
             if (sampledHitErrors.count > 0) payload[@"sample_errors"] = sampledHitErrors;
             payload[@"elements"] = elements;
-            resultPayload = payload;
+            resultPayload = MCPAXNodeResultInFixedCoordinates(payload, geometry.interfaceToFixed);
         } @catch (NSException *exception) {
             resultError = [NSString stringWithFormat:@"compact AX crawl exception: %@: %@",
                            exception.name,
@@ -2742,7 +2787,8 @@ static NSDictionary *MCPAXNodeUserTestingSnapshotSummary(NSDictionary *snapshot)
 
             CGPoint samplePoint = pointValue.CGPointValue;
             NSString *hitError = nil;
-            AXUIElementRef hitElement = [self.attributeBridge copyHitTestElementAtPoint:samplePoint
+            CGPoint fixedSample = CGPointApplyAffineTransform(samplePoint, MCPGetScreenGeometry().interfaceToFixed);
+            AXUIElementRef hitElement = [self.attributeBridge copyHitTestElementAtPoint:fixedSample
                                                                             expectedPid:pid
                                                                      allowParameterized:YES
                                                                                   error:&hitError];

@@ -60,8 +60,10 @@ static int _eventsToAppend[MAX_FINGER_INDEX][4];
         dispatch_block_t initBlock = ^{
             UIScreen *screen = [UIScreen mainScreen];
             self->_screenScale = screen.scale;
-            self->_screenWidth = screen.bounds.size.width;
-            self->_screenHeight = screen.bounds.size.height;
+            // Digitizer coordinates follow the fixed screen, not the interface orientation at
+            // the time this lazy singleton happens to be initialized (which may be landscape).
+            self->_screenWidth = screen.fixedCoordinateSpace.bounds.size.width;
+            self->_screenHeight = screen.fixedCoordinateSpace.bounds.size.height;
             _deviceScreenWidth = self->_screenWidth;
             _deviceScreenHeight = self->_screenHeight;
             memset(_eventsToAppend, 0, sizeof(_eventsToAppend));
