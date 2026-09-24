@@ -2275,10 +2275,19 @@ static NSString *MCPLogId(id reqId) {
             @"inputSchema": @{
                 @"type": @"object",
                 @"properties": @{
-                    @"languages": @{@"type": @"array", @"items": @{@"type": @"string"}, @"description": @"Recognition languages, e.g. ['zh-Hans','en-US']. Default ['zh-Hans','en-US']."},
+                    @"languages": @{@"type": @"array", @"items": @{@"type": @"string"}, @"description": @"Recognition languages in priority order. Put Chinese first to recognize Chinese, e.g. ['zh-Hans','en-US'] (default). Unsupported languages return an error."},
                     @"min_confidence": @{@"type": @"number", @"description": @"Drop results below this confidence 0..1 (default 0.3)."},
-                    @"region": @{@"type": @"object", @"description": @"Optional screen-point rect {x,y,width,height} to limit OCR to a region."},
-                    @"fast": @{@"type": @"boolean", @"description": @"Fast mode: ~10x faster (sub-second) but recognizes fewer items and is weaker on small/CJK text. Default false (accurate). Use fast for quick scans of large/Latin text."}
+                    @"region": @{
+                        @"type": @"object",
+                        @"properties": @{
+                            @"x": @{@"type": @"number"}, @"y": @{@"type": @"number"},
+                            @"width": @{@"type": @"number", @"exclusiveMinimum": @0},
+                            @"height": @{@"type": @"number", @"exclusiveMinimum": @0}
+                        },
+                        @"required": @[@"x", @"y", @"width", @"height"],
+                        @"description": @"Optional screen-point rect {x,y,width,height}. All fields must be finite numbers and width/height must be positive. Partly off-screen regions are clipped; wholly off-screen regions return empty texts. Omit for full-screen OCR."
+                    },
+                    @"fast": @{@"type": @"boolean", @"default": @YES, @"description": @"Prefer fast recognition (default true). Automatically uses accurate when fast does not support the requested languages (e.g. Chinese, included in the default languages). Set languages to ['en-US'] for fast English OCR. Accurate recognition runs directly on CPU. The recognition field reports the actual mode and CPU configuration."}
                 }
             }
         },
@@ -3610,9 +3619,12 @@ static NSString *MCPLogId(id reqId) {
         for (id l in langs) { if ([l isKindOfClass:[NSString class]]) [valid addObject:l]; }
         if (valid.count > 0) languages = valid;
     }
-    NSDictionary *region = [args[@"region"] isKindOfClass:[NSDictionary class]] ? args[@"region"] : nil;
-    BOOL fast = NO;
-    if (!MCPBoolFromArgs(args, @"fast", NO, &fast, &paramError)) {
+    NSDictionary *region = args[@"region"];
+    if (![OCRManager validateRegion:region error:&paramError]) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
+    BOOL fast = YES;
+    if (!MCPBoolFromArgs(args, @"fast", YES, &fast, &paramError)) {
         return [self mcpError:reqId code:-32602 message:paramError];
     }
 
@@ -3676,12 +3688,15 @@ static NSString *MCPLogId(id reqId) {
         NSDictionary *ocr = [[OCRManager sharedInstance] recognizeTextWithLanguages:nil
                                                                       minConfidence:0.3
                                                                              region:nil
-                                                                               fast:NO
+                                                                               fast:YES
                                                                               error:&ocrErr];
         if ([ocr[@"texts"] isKindOfClass:[NSArray class]]) {
             out[@"ocr_texts"] = ocr[@"texts"];
+            out[@"ocr_recognition"] = ocr[@"recognition"];
             source = @"accessibility+ocr";
             if (!out[@"screen"] && [ocr[@"screen"] isKindOfClass:[NSDictionary class]]) out[@"screen"] = ocr[@"screen"];
+        } else if (ocrErr) {
+            out[@"ocr_error"] = ocrErr;
         }
     }
 
