@@ -24,6 +24,9 @@ iOS MCP 是一个运行在越狱 iPhone 上的 [MCP (Model Context Protocol)](ht
 
 共 **46** 个 MCP 工具，覆盖 iOS 设备自动化与逆向调试的主要场景。
 
+`install_app` 支持 `.ipa`、`.tipa` 和 `.deb`（扩展名不区分大小写）。`.tipa` 按 IPA 安装；
+电脑上的文件需先通过 `POST /upload_file` 上传，再将返回的设备路径传给 `install_app`。
+
 `ocr_screen` 与 `describe_screen(include_ocr=true)` 支持可选的 `engine` 参数：
 省略或传 `"paddleocr"` 使用离线 PaddleOCR + ONNX Runtime CPU；传 `"vision"` 使用 Apple Vision。
 选择仅影响当前请求，失败不会自动换引擎。Vision 在 iOS 13 默认识别英文；PaddleOCR 支持中英文与数字。

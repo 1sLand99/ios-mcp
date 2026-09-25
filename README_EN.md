@@ -24,6 +24,9 @@ iOS MCP is an [MCP (Model Context Protocol)](https://modelcontextprotocol.io) se
 
 **46** MCP tools covering the major iOS device automation and reverse-engineering scenarios.
 
+`install_app` supports `.ipa`, `.tipa`, and `.deb` (case-insensitive extensions). `.tipa` uses the IPA install flow.
+For computer-local files, upload through `POST /upload_file` first, then pass the returned device path to `install_app`.
+
 `ocr_screen` and `describe_screen(include_ocr=true)` accept an optional `engine`:
 omitted/`"paddleocr"` uses offline PaddleOCR with ONNX Runtime CPU;
 `"vision"` uses Apple Vision. Selection is per request, with no automatic engine fallback.
