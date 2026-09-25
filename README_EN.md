@@ -24,6 +24,12 @@ iOS MCP is an [MCP (Model Context Protocol)](https://modelcontextprotocol.io) se
 
 **46** MCP tools covering the major iOS device automation and reverse-engineering scenarios.
 
+`ocr_screen` and `describe_screen(include_ocr=true)` accept an optional `engine`:
+omitted/`"paddleocr"` uses offline PaddleOCR with ONNX Runtime CPU;
+`"vision"` uses Apple Vision. Selection is per request, with no automatic engine fallback.
+Vision defaults to English on iOS 13; PaddleOCR supports Chinese, English and digits.
+See [OCR engines, build instructions and validation](docs/PADDLEOCR.md).
+
 ## Runtime Requirements
 
 - Jailbroken iOS device

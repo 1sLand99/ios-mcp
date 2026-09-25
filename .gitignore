@@ -35,3 +35,8 @@ _/*
 **/obj/*
 .claude
 .codex/
+
+# Rebuilt, SHA256-verified PaddleOCR dependencies (sources/lockfiles remain tracked).
+/third_party/paddleocr/runtime/
+/third_party/paddleocr/models/*.onnx
+__pycache__/

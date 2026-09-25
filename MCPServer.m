@@ -9,6 +9,7 @@
 #import "FileSystemManager.h"
 #import "LogManager.h"
 #import "OCRManager.h"
+#import "MCPOCRRequestContext.h"
 #import "MCPLogger.h"
 #import <UIKit/UIKit.h>
 #import <sys/socket.h>
@@ -730,7 +731,7 @@ static const void *MCPServerLifecycleQueueKey = &MCPServerLifecycleQueueKey;
                        initialBodyLength:(ssize_t)initialBodyLength
                              errorStatus:(int *)errorStatus
                             errorMessage:(NSString **)errorMessage;
-- (void)handleMCPRequest:(NSData *)bodyData clientSocket:(int)clientSocket requestLogId:(NSString *)requestLogId;
+- (void)handleMCPRequest:(NSData *)bodyData clientSocket:(int)clientSocket requestLogId:(NSString *)requestLogId session:(NSString *)session;
 - (NSDictionary *)routeMCPRequest:(NSDictionary *)request;
 - (NSDictionary *)handleInitialize:(id)reqId params:(NSDictionary *)params;
 - (NSDictionary *)handleToolsList:(id)reqId;
@@ -1349,7 +1350,7 @@ static const void *MCPServerLifecycleQueueKey = &MCPServerLifecycleQueueKey;
                 return;
             }
 
-            [self handleMCPRequest:bodyData clientSocket:clientSocket requestLogId:requestLogId];
+            [self handleMCPRequest:bodyData clientSocket:clientSocket requestLogId:requestLogId session:headers[@"mcp-session-id"]];
             free(buffer);
             return;
         }
@@ -1376,7 +1377,7 @@ static const void *MCPServerLifecycleQueueKey = &MCPServerLifecycleQueueKey;
         }
 
         NSData *bodyData = [NSData dataWithBytes:buffer + headerEnd length:MIN(bodyReceived, contentLength)];
-        [self handleMCPRequest:bodyData clientSocket:clientSocket requestLogId:requestLogId];
+        [self handleMCPRequest:bodyData clientSocket:clientSocket requestLogId:requestLogId session:headers[@"mcp-session-id"]];
     } else if ([basePath isEqualToString:@"/mcp"]) {
         [self sendMethodNotAllowedResponse:clientSocket allowedMethods:@"POST" message:@"Method Not Allowed" requestLogId:requestLogId];
     } else if ([method isEqualToString:@"POST"] && [basePath isEqualToString:@"/upload_file"]) {
@@ -1851,11 +1852,12 @@ static NSString *MCPLogId(id reqId) {
     return MCPLogSnippet(raw, 128);
 }
 
-- (void)handleMCPRequest:(NSData *)bodyData clientSocket:(int)clientSocket requestLogId:(NSString *)requestLogId {
+- (void)handleMCPRequest:(NSData *)bodyData clientSocket:(int)clientSocket requestLogId:(NSString *)requestLogId session:(NSString *)session {
     NSDate *mcpStart = [NSDate date];
     id logReqId = nil;
     NSString *methodName = @"<parse_error>";
     NSString *toolName = nil;
+    MCPOCRRequestContext *ocrContext = nil;
 
     @try {
         NSError *jsonError;
@@ -1883,6 +1885,26 @@ static NSString *MCPLogId(id reqId) {
             toolName = [params[@"name"] isKindOfClass:[NSString class]] ? params[@"name"] : @"<missing>";
         }
 
+        if ([methodName isEqualToString:@"notifications/cancelled"]) {
+            [MCPOCRRequestContext cancelRequest:params[@"requestId"] session:session];
+            [self sendEmptyResponse:clientSocket status:202 requestLogId:requestLogId];
+            return;
+        }
+        NSDictionary *arguments = [params[@"arguments"] isKindOfClass:NSDictionary.class] ? params[@"arguments"] : nil;
+        BOOL performsOCR = [toolName isEqualToString:@"ocr_screen"];
+        if ([toolName isEqualToString:@"describe_screen"]) {
+            BOOL includeOCR = NO;
+            performsOCR = MCPBoolFromArgs(arguments, @"include_ocr", NO, &includeOCR, NULL) && includeOCR;
+        }
+        // Resolve omitted engine exactly as the execution layer does: default Paddle
+        // requests also need cancellation, disconnect and request-deadline tracking.
+        if (performsOCR && [(arguments[@"engine"] ?: [OCRManager defaultEngine]) isEqual:@"paddleocr"]) {
+            ocrContext = [MCPOCRRequestContext beginRequest:request[@"id"] session:session socket:clientSocket];
+            if (!ocrContext) {
+                [self sendJSONResponse:clientSocket status:200 body:[self mcpError:request[@"id"] code:-32600 message:@"Duplicate active OCR request id"] requestLogId:requestLogId];
+                return;
+            }
+        }
         NSDictionary *response = [self routeMCPRequest:request];
 
         // 区分四种结果：notification / result(成功) / tool_error(isError 软失败，含锁屏拦截) /
@@ -1948,6 +1970,8 @@ static NSString *MCPLogId(id reqId) {
             }
         };
         [self sendJSONResponse:clientSocket status:200 body:errResp requestLogId:requestLogId];
+    } @finally {
+        [ocrContext finish];
     }
 }
 
@@ -2271,12 +2295,13 @@ static NSString *MCPLogId(id reqId) {
         },
         @{
             @"name": @"ocr_screen",
-            @"description": @"Recognize text on the current screen via on-device OCR (Vision framework) and return each text block with screen-point coordinates. Use this when get_ui_elements/tap_element cannot see the content — games, Flutter/React Native/Unity apps, canvas-rendered UI, or text inside images. Each result includes a ready-to-use tap point. Pair with tap_screen to tap recognized text.",
+            @"description": @"Recognize screen text locally and return screen-point rects and tap points. engine defaults to paddleocr per request, using bundled PP-OCRv5 mobile models with ONNX Runtime CPU only. Set engine=vision for Apple Vision. No cross-engine fallback. Use for text missing from the accessibility tree.",
             @"inputSchema": @{
                 @"type": @"object",
                 @"properties": @{
-                    @"languages": @{@"type": @"array", @"items": @{@"type": @"string"}, @"description": @"Recognition languages in priority order. Put Chinese first to recognize Chinese, e.g. ['zh-Hans','en-US'] (default). Unsupported languages return an error."},
-                    @"min_confidence": @{@"type": @"number", @"description": @"Drop results below this confidence 0..1 (default 0.3)."},
+                    @"engine": @{@"type": @"string", @"enum": @[@"vision", @"paddleocr"], @"default": [OCRManager defaultEngine], @"description": @"Current request only. Omitted always means paddleocr; set vision for Apple Vision. Errors never switch engine."},
+                    @"languages": @{@"type": @"array", @"items": @{@"type": @"string"}, @"description": @"Vision defaults to supported Chinese+English on iOS 14+, English on iOS 13. Explicit unsupported languages fail. PaddleOCR uses one Chinese+English model; language hints do not restrict its alphabet."},
+                    @"min_confidence": @{@"type": @"number", @"description": @"Drop results below 0..1 (default 0.3). Vision confidence is unchanged; PaddleOCR uses mean CTC probability, not an equivalent calibrated score."},
                     @"region": @{
                         @"type": @"object",
                         @"properties": @{
@@ -2287,7 +2312,7 @@ static NSString *MCPLogId(id reqId) {
                         @"required": @[@"x", @"y", @"width", @"height"],
                         @"description": @"Optional screen-point rect {x,y,width,height}. All fields must be finite numbers and width/height must be positive. Partly off-screen regions are clipped; wholly off-screen regions return empty texts. Omit for full-screen OCR."
                     },
-                    @"fast": @{@"type": @"boolean", @"default": @YES, @"description": @"Prefer fast recognition (default true). Automatically uses accurate when fast does not support the requested languages (e.g. Chinese, included in the default languages). Set languages to ['en-US'] for fast English OCR. Accurate recognition runs directly on CPU. The recognition field reports the actual mode and CPU configuration."}
+                    @"fast": @{@"type": @"boolean", @"default": @YES, @"description": @"Vision speed preference (default true); uses accurate if required for the languages. Accurate runs on CPU. PaddleOCR always uses the same mobile model regardless of fast, reported in recognition.adjustments."}
                 }
             }
         },
@@ -2299,6 +2324,7 @@ static NSString *MCPLogId(id reqId) {
                 @"properties": @{
                     @"include_screenshot": @{@"type": @"boolean", @"description": @"Include a base64 JPEG screenshot (default false, saves tokens)."},
                     @"include_ocr": @{@"type": @"boolean", @"description": @"Add an OCR text layer for content not in the accessibility tree (default false)."},
+                    @"engine": @{@"type": @"string", @"enum": @[@"vision", @"paddleocr"], @"default": [OCRManager defaultEngine], @"description": @"OCR engine for this request when include_ocr is true. Omitted always means paddleocr; set vision for Apple Vision. No fallback."},
                     @"clickable_only": @{@"type": @"boolean", @"description": @"Only return clickable elements (default true)."}
                 }
             }
@@ -3605,6 +3631,9 @@ static NSString *MCPLogId(id reqId) {
 
 - (NSDictionary *)executeOCRScreen:(id)reqId args:(NSDictionary *)args {
     NSString *paramError = nil;
+    if (![OCRManager validateEngine:args[@"engine"] error:&paramError]) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
     double minConfidence = 0.3;
     if (!MCPNumberFromArgs(args, @"min_confidence", 0.3, NO, &minConfidence, &paramError)) {
         return [self mcpError:reqId code:-32602 message:paramError];
@@ -3633,6 +3662,7 @@ static NSString *MCPLogId(id reqId) {
                                                                     minConfidence:minConfidence
                                                                            region:region
                                                                              fast:fast
+                                                                           engine:args[@"engine"]
                                                                             error:&err];
     if (!result) {
         return [self mcpSuccess:reqId text:(err ?: @"OCR failed") isError:YES];
@@ -3642,6 +3672,9 @@ static NSString *MCPLogId(id reqId) {
 
 - (NSDictionary *)executeDescribeScreen:(id)reqId args:(NSDictionary *)args {
     NSString *paramError = nil;
+    if (![OCRManager validateEngine:args[@"engine"] error:&paramError]) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
     BOOL includeScreenshot = NO, includeOCR = NO, clickableOnly = YES;
     if (!MCPBoolFromArgs(args, @"include_screenshot", NO, &includeScreenshot, &paramError) ||
         !MCPBoolFromArgs(args, @"include_ocr", NO, &includeOCR, &paramError) ||
@@ -3689,6 +3722,7 @@ static NSString *MCPLogId(id reqId) {
                                                                       minConfidence:0.3
                                                                              region:nil
                                                                                fast:YES
+                                                                             engine:args[@"engine"]
                                                                               error:&ocrErr];
         if ([ocr[@"texts"] isKindOfClass:[NSArray class]]) {
             out[@"ocr_texts"] = ocr[@"texts"];

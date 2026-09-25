@@ -1,0 +1,23 @@
+{
+  "runtime": {"version": "1.20.1", "provider": "CPUExecutionProvider", "ios_min": "13.0", "arch": "arm64", "license": "MIT"},
+  "models": {
+    "family": "PP-OCRv5_mobile",
+    "license": "Apache-2.0",
+    "det_revision": "e6f4fa85f00e168c862bc462aebca69eef9b3d3d",
+    "rec_revision": "ed152b8b495f84de93cda5709d768548a9127622",
+    "det_ir": 6, "det_opset": 11, "rec_ir": 3, "rec_opset": 7,
+    "dtype": "float32", "ctc_classes": 18385
+  },
+  "downloads": [
+    {"path": ".codex-session-data/paddle-build/onnxruntime-1.20.1.tar.gz", "url": "https://github.com/microsoft/onnxruntime/archive/refs/tags/v1.20.1.tar.gz", "sha256": "d4c005506a2bbf88a838b14f8d1578406b8be2fb64abb50beeff908fb272529e"},
+    {"path": ".codex-session-data/paddle-build/opencv-4.10.0.tar.gz", "url": "https://github.com/opencv/opencv/archive/refs/tags/4.10.0.tar.gz", "sha256": "b2171af5be6b26f7a06b1229948bbb2bdaa74fcf5cd097e0af6378fce50a6eb9"},
+    {"path": ".codex-session-data/paddle-build/eigen.zip", "url": "https://gitlab.com/libeigen/eigen/-/archive/e7248b26a1ed53fa030c5c459f7ea095dfd276ac/eigen-e7248b26a1ed53fa030c5c459f7ea095dfd276ac.zip", "sha256": "a50ef69dad8d694136806051841a382f09290c9af811b13a2955b56640484007"},
+    {"path": "third_party/paddleocr/models/det.onnx", "url": "https://huggingface.co/PaddlePaddle/PP-OCRv5_mobile_det_onnx/resolve/e6f4fa85f00e168c862bc462aebca69eef9b3d3d/inference.onnx", "sha256": "a431985659dc921974177a95adcfbb90fd9e51989a5e04d70d0b75f597b6e61d"},
+    {"path": "third_party/paddleocr/models/rec.onnx", "url": "https://huggingface.co/PaddlePaddle/PP-OCRv5_mobile_rec_onnx/resolve/ed152b8b495f84de93cda5709d768548a9127622/inference.onnx", "sha256": "da72dc72ca4dc220df0dfde68c1dedc31c58d3e76a25871122e5056227d50092"},
+    {"path": "third_party/paddleocr/models/det.yml", "url": "https://huggingface.co/PaddlePaddle/PP-OCRv5_mobile_det_onnx/resolve/e6f4fa85f00e168c862bc462aebca69eef9b3d3d/inference.yml", "sha256": "98069072e1b6b37d727fd9d9f11725faa46d6ea0de012f2ed26caea011c37699"},
+    {"path": "third_party/paddleocr/models/rec.yml", "url": "https://huggingface.co/PaddlePaddle/PP-OCRv5_mobile_rec_onnx/resolve/ed152b8b495f84de93cda5709d768548a9127622/inference.yml", "sha256": "5dfeb2777f6d0db8177d8128a8acfcf6e6276dc4ac73ea3bf0dc06d6a5e85d8e"}
+  ],
+  "clipper": {"version": "6.4.2", "license": "BSL-1.0", "source": "https://github.com/PaddlePaddle/PaddleOCR/tree/v3.0.3/deploy/cpp_infer", "local_change": "include/clipper.h changed to clipper.h"},
+  "opencv": {"version": "4.10.0", "modules": ["core", "imgproc"], "license": "Apache-2.0"},
+  "eigen": {"revision": "e7248b26a1ed53fa030c5c459f7ea095dfd276ac", "license": "MPL-2.0", "note": "GitLab regenerated ZIP metadata: lock current SHA256; use preinstalled Eigen to avoid ORT's stale archive SHA1. Source revision unchanged."}
+}
