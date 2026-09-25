@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--version', default='1.2.6')
+    p.add_argument('--version', default='1.2.7')
     p.add_argument('--arch', action='append', choices=['arm', 'arm64', 'arm64e'],
                    help='Audit selected package(s); defaults to all three')
     p.add_argument('--out', default='.codex-session-data/paddle-build/package-audit.json')

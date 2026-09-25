@@ -216,7 +216,7 @@ recorded separately; do not substitute host tests for iOS 13 runtime coverage.
 Device/package checks (use only on devices authorized for UI and fault tests):
 
 ```sh
-python3 tests/paddle_package_test.py --version 1.2.6
+python3 tests/paddle_package_test.py --version 1.2.7
 # Or inspect only an available scheme: --arch arm / --arch arm64 / --arch arm64e
 python3 tests/install_test_package.py --url http://DEVICE:8090/mcp packages/MATCHING.deb
 python3 tests/mcp_ocr_engines_test.py --url http://DEVICE:8090/mcp --out engine-results.json
