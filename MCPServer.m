@@ -9,6 +9,7 @@
 #import "FileSystemManager.h"
 #import "LogManager.h"
 #import "OCRManager.h"
+#import "MCPOCRRequestContext.h"
 #import "MCPLogger.h"
 #import <UIKit/UIKit.h>
 #import <sys/socket.h>
@@ -31,7 +32,7 @@
 #define MCP_PROTOCOL_VERSION_LATEST @"2025-11-25"
 #define MCP_PROTOCOL_VERSION_LEGACY @"2025-03-26"
 #define MCP_SERVER_NAME             @"ios-mcp"
-#define MCP_SERVER_VERSION          @"1.2.6"
+#define MCP_SERVER_VERSION          @"1.2.7"
 #define HTTP_BUF_SIZE        (256 * 1024)
 #define MCP_MAX_CHUNK_LINE   (8 * 1024)
 #define MCP_UPLOAD_DIR       @"/var/mobile/Library/Caches/ios-mcp-uploads"
@@ -730,7 +731,7 @@ static const void *MCPServerLifecycleQueueKey = &MCPServerLifecycleQueueKey;
                        initialBodyLength:(ssize_t)initialBodyLength
                              errorStatus:(int *)errorStatus
                             errorMessage:(NSString **)errorMessage;
-- (void)handleMCPRequest:(NSData *)bodyData clientSocket:(int)clientSocket requestLogId:(NSString *)requestLogId;
+- (void)handleMCPRequest:(NSData *)bodyData clientSocket:(int)clientSocket requestLogId:(NSString *)requestLogId session:(NSString *)session;
 - (NSDictionary *)routeMCPRequest:(NSDictionary *)request;
 - (NSDictionary *)handleInitialize:(id)reqId params:(NSDictionary *)params;
 - (NSDictionary *)handleToolsList:(id)reqId;
@@ -1349,7 +1350,7 @@ static const void *MCPServerLifecycleQueueKey = &MCPServerLifecycleQueueKey;
                 return;
             }
 
-            [self handleMCPRequest:bodyData clientSocket:clientSocket requestLogId:requestLogId];
+            [self handleMCPRequest:bodyData clientSocket:clientSocket requestLogId:requestLogId session:headers[@"mcp-session-id"]];
             free(buffer);
             return;
         }
@@ -1376,7 +1377,7 @@ static const void *MCPServerLifecycleQueueKey = &MCPServerLifecycleQueueKey;
         }
 
         NSData *bodyData = [NSData dataWithBytes:buffer + headerEnd length:MIN(bodyReceived, contentLength)];
-        [self handleMCPRequest:bodyData clientSocket:clientSocket requestLogId:requestLogId];
+        [self handleMCPRequest:bodyData clientSocket:clientSocket requestLogId:requestLogId session:headers[@"mcp-session-id"]];
     } else if ([basePath isEqualToString:@"/mcp"]) {
         [self sendMethodNotAllowedResponse:clientSocket allowedMethods:@"POST" message:@"Method Not Allowed" requestLogId:requestLogId];
     } else if ([method isEqualToString:@"POST"] && [basePath isEqualToString:@"/upload_file"]) {
@@ -1851,11 +1852,12 @@ static NSString *MCPLogId(id reqId) {
     return MCPLogSnippet(raw, 128);
 }
 
-- (void)handleMCPRequest:(NSData *)bodyData clientSocket:(int)clientSocket requestLogId:(NSString *)requestLogId {
+- (void)handleMCPRequest:(NSData *)bodyData clientSocket:(int)clientSocket requestLogId:(NSString *)requestLogId session:(NSString *)session {
     NSDate *mcpStart = [NSDate date];
     id logReqId = nil;
     NSString *methodName = @"<parse_error>";
     NSString *toolName = nil;
+    MCPOCRRequestContext *ocrContext = nil;
 
     @try {
         NSError *jsonError;
@@ -1883,6 +1885,26 @@ static NSString *MCPLogId(id reqId) {
             toolName = [params[@"name"] isKindOfClass:[NSString class]] ? params[@"name"] : @"<missing>";
         }
 
+        if ([methodName isEqualToString:@"notifications/cancelled"]) {
+            [MCPOCRRequestContext cancelRequest:params[@"requestId"] session:session];
+            [self sendEmptyResponse:clientSocket status:202 requestLogId:requestLogId];
+            return;
+        }
+        NSDictionary *arguments = [params[@"arguments"] isKindOfClass:NSDictionary.class] ? params[@"arguments"] : nil;
+        BOOL performsOCR = [toolName isEqualToString:@"ocr_screen"];
+        if ([toolName isEqualToString:@"describe_screen"]) {
+            BOOL includeOCR = NO;
+            performsOCR = MCPBoolFromArgs(arguments, @"include_ocr", NO, &includeOCR, NULL) && includeOCR;
+        }
+        // Resolve omitted engine exactly as the execution layer does: default Paddle
+        // requests also need cancellation, disconnect and request-deadline tracking.
+        if (performsOCR && [(arguments[@"engine"] ?: [OCRManager defaultEngine]) isEqual:@"paddleocr"]) {
+            ocrContext = [MCPOCRRequestContext beginRequest:request[@"id"] session:session socket:clientSocket];
+            if (!ocrContext) {
+                [self sendJSONResponse:clientSocket status:200 body:[self mcpError:request[@"id"] code:-32600 message:@"Duplicate active OCR request id"] requestLogId:requestLogId];
+                return;
+            }
+        }
         NSDictionary *response = [self routeMCPRequest:request];
 
         // 区分四种结果：notification / result(成功) / tool_error(isError 软失败，含锁屏拦截) /
@@ -1948,6 +1970,8 @@ static NSString *MCPLogId(id reqId) {
             }
         };
         [self sendJSONResponse:clientSocket status:200 body:errResp requestLogId:requestLogId];
+    } @finally {
+        [ocrContext finish];
     }
 }
 
@@ -2018,7 +2042,7 @@ static NSString *MCPLogId(id reqId) {
                     @"httpHeader": @"MCP-Protocol-Version"
                 }
             },
-            @"instructions": @"Use ios-mcp to inspect and operate the connected iPhone.\n\nGetting started: call get_frontmost_app, get_screen_info, get_ui_elements, and screenshot to understand the current device state. get_screen_info includes device_state when SpringBoard exposes it. If locked is true, screen_on is false, the screenshot looks like the Lock Screen, or UI elements are from SpringBoard/Lock Screen, do not continue normal app automation until the device is awake/unlocked.\n\nLock screen handling: a single press_home only wakes or advances the Lock Screen and must not be treated as reaching the Home screen. Use wake_and_home when the device may be locked/off. The equivalent manual sequence is Power then Home when the screen is off, or Home twice when the Lock Screen is already visible. After wake_and_home, verify with screenshot/get_ui_elements/get_frontmost_app before continuing. The server enforces a lock guard: while locked or screen_off, interactive and mutating tools are blocked; only observation and recovery tools are allowed.\n\nTouch and gestures: use screen point coordinates for tap_screen, swipe_screen, long_press, double_tap, and drag_and_drop. There is a single coordinate space: screenshots are returned at point size (one image pixel = one screen point), and get_ui_elements/tap_element/ocr_screen also report points, so coordinates from any of them are passed to the touch tools unchanged — never divide by the Retina scale. drag_and_drop accepts either fromX/fromY/toX/toY for a straight drag, or points for a path where the first point is pressed and the last point is released. For Flutter or custom-rendered apps, accessibility may expose only a container such as FlutterView; use screenshot plus coordinates in that case.\n\nText input: use input_text first for fast bulk text through system keyboard events. If input_text returns isError or reports failure/timeout, immediately retry the same text with type_text; do not repeat input_text. Use type_text for character-by-character input and press_key for special keys (enter, delete, tab, etc.).\n\nHardware buttons: press_home, press_power, press_volume_up, press_volume_down, toggle_mute, wake_and_home.\n\nClipboard: get_clipboard and set_clipboard to read/write clipboard contents.\n\nScreenshot: the screenshot tool returns MCP image content, not text — result.content[0].data contains the base64 JPEG payload and result.content[0].mimeType is image/jpeg. The image is point-sized, so coordinates measured on it are valid tap_screen coordinates directly.\n\nApp management: launch_app, kill_app, list_apps, list_running_apps, get_frontmost_app. launch_app waits until the target app is actually frontmost before returning, so do not immediately re-issue redundant foreground checks unless you need to verify a later transition. To install an IPA or DEB from the computer, first upload raw file bytes to POST /upload_file (for example: curl -H 'X-Filename: app.ipa' --data-binary @app.ipa http://device-ip:<server-port>/upload_file or curl -H 'X-Filename: package.deb' --data-binary @package.deb http://device-ip:<server-port>/upload_file). The upload response returns a device path under /var/mobile/Library/Caches/ios-mcp-uploads; pass that path to install_app. To install an IPA or DEB already on the phone, call install_app directly with its device path. Unsigned or fakesigned IPAs are supported. DEB installs use dpkg and restart SpringBoard after installation succeeds. To uninstall an app, use list_apps to find the bundle_id, then call uninstall_app. To uninstall a DEB package, call uninstall_app with package_id; DEB removal uses dpkg and restarts SpringBoard after success.\n\nDevice control: get_brightness/set_brightness, get_volume/set_volume, open_url (supports http/https and URL schemes like tel://, prefs:root=WIFI, etc.).\n\nDevice info: get_device_info for model, iOS version, battery, storage, memory, and jailbreak type/package information. Pass debug=true only when diagnosing installation integrity to include bundled helper executable status.\n\nHealth checks: avoid shell brace expansion such as for i in {1..30}; ios-mcp commands often run under /bin/sh where that may execute only once. Use seq or a while loop, and use at least --connect-timeout 3 plus --max-time 5 for /health.\n\nShell: run_command to execute shell commands on the device (timeout default 10s, max 30s).\n\nReverse engineering and debugging: get_app_info returns an installed app's bundle path, data container (sandbox) path, App Group container paths, executable path, version, and entitlements — call it first to locate files. list_dir, read_file, and write_file operate on the device filesystem and fall back to the privileged mcp-root helper for protected paths (other apps' sandboxes, system dirs). read_file returns utf8 for text and base64 for binary; it is capped (default 512KB), so for large or binary files use GET /download_file?path=<device-path> to stream the full file (for example: curl 'http://device-ip:<server-port>/download_file?path=/var/mobile/...' -o out.bin). get_syslog captures the live unified system log across all processes (the stream Console.app shows) for a few seconds — it is a live capture, so trigger the activity you want to observe during the window. get_crash_logs lists crash reports (filter by bundle_id), and read_crash_log returns a single report's full text. write_file is blocked while the device is locked or the screen is off."
+            @"instructions": @"Use ios-mcp to inspect and operate the connected iPhone.\n\nGetting started: call get_frontmost_app, get_screen_info, get_ui_elements, and screenshot to understand the current device state. get_screen_info includes device_state when SpringBoard exposes it. If locked is true, screen_on is false, the screenshot looks like the Lock Screen, or UI elements are from SpringBoard/Lock Screen, do not continue normal app automation until the device is awake/unlocked.\n\nLock screen handling: a single press_home only wakes or advances the Lock Screen and must not be treated as reaching the Home screen. Use wake_and_home when the device may be locked/off. The equivalent manual sequence is Power then Home when the screen is off, or Home twice when the Lock Screen is already visible. After wake_and_home, verify with screenshot/get_ui_elements/get_frontmost_app before continuing. The server enforces a lock guard: while locked or screen_off, interactive and mutating tools are blocked; only observation and recovery tools are allowed.\n\nTouch and gestures: use screen point coordinates for tap_screen, swipe_screen, long_press, double_tap, and drag_and_drop. There is a single coordinate space: screenshots are returned at point size (one image pixel = one screen point), and get_ui_elements/tap_element/ocr_screen also report points, so coordinates from any of them are passed to the touch tools unchanged — never divide by the Retina scale. drag_and_drop accepts either fromX/fromY/toX/toY for a straight drag, or points for a path where the first point is pressed and the last point is released. For Flutter or custom-rendered apps, accessibility may expose only a container such as FlutterView; use screenshot plus coordinates in that case.\n\nText input: use input_text first for fast bulk text through system keyboard events. If input_text returns isError or reports failure/timeout, immediately retry the same text with type_text; do not repeat input_text. Use type_text for character-by-character input and press_key for special keys (enter, delete, tab, etc.).\n\nHardware buttons: press_home, press_power, press_volume_up, press_volume_down, toggle_mute, wake_and_home.\n\nClipboard: get_clipboard and set_clipboard to read/write clipboard contents.\n\nScreenshot: the screenshot tool returns MCP image content, not text — result.content[0].data contains the base64 JPEG payload and result.content[0].mimeType is image/jpeg. The image is point-sized, so coordinates measured on it are valid tap_screen coordinates directly.\n\nApp management: launch_app, kill_app, list_apps, list_running_apps, get_frontmost_app. launch_app waits until the target app is actually frontmost before returning, so do not immediately re-issue redundant foreground checks unless you need to verify a later transition. To install an IPA, TIPA or DEB from the computer, first upload raw file bytes to POST /upload_file (for example: curl -H 'X-Filename: app.ipa' --data-binary @app.ipa http://device-ip:<server-port>/upload_file or curl -H 'X-Filename: package.deb' --data-binary @package.deb http://device-ip:<server-port>/upload_file). The upload response returns a device path under /var/mobile/Library/Caches/ios-mcp-uploads; pass that path to install_app. To install an IPA, TIPA or DEB already on the phone, call install_app directly with its device path. TIPA files use the same IPA install flow. Unsigned or fakesigned IPAs are supported. DEB installs use dpkg and restart SpringBoard after installation succeeds. To uninstall an app, use list_apps to find the bundle_id, then call uninstall_app. To uninstall a DEB package, call uninstall_app with package_id; DEB removal uses dpkg and restarts SpringBoard after success.\n\nDevice control: get_brightness/set_brightness, get_volume/set_volume, open_url (supports http/https and URL schemes like tel://, prefs:root=WIFI, etc.).\n\nDevice info: get_device_info for model, iOS version, battery, storage, memory, and jailbreak type/package information. Pass debug=true only when diagnosing installation integrity to include bundled helper executable status.\n\nHealth checks: avoid shell brace expansion such as for i in {1..30}; ios-mcp commands often run under /bin/sh where that may execute only once. Use seq or a while loop, and use at least --connect-timeout 3 plus --max-time 5 for /health.\n\nShell: run_command to execute shell commands on the device (timeout default 10s, max 30s).\n\nReverse engineering and debugging: get_app_info returns an installed app's bundle path, data container (sandbox) path, App Group container paths, executable path, version, and entitlements — call it first to locate files. list_dir, read_file, and write_file operate on the device filesystem and fall back to the privileged mcp-root helper for protected paths (other apps' sandboxes, system dirs). read_file returns utf8 for text and base64 for binary; it is capped (default 512KB), so for large or binary files use GET /download_file?path=<device-path> to stream the full file (for example: curl 'http://device-ip:<server-port>/download_file?path=/var/mobile/...' -o out.bin). get_syslog captures the live unified system log across all processes (the stream Console.app shows) for a few seconds — it is a live capture, so trigger the activity you want to observe during the window. get_crash_logs lists crash reports (filter by bundle_id), and read_crash_log returns a single report's full text. write_file is blocked while the device is locked or the screen is off."
         }
     };
 }
@@ -2271,12 +2295,13 @@ static NSString *MCPLogId(id reqId) {
         },
         @{
             @"name": @"ocr_screen",
-            @"description": @"Recognize text on the current screen via on-device OCR (Vision framework) and return each text block with screen-point coordinates. Use this when get_ui_elements/tap_element cannot see the content — games, Flutter/React Native/Unity apps, canvas-rendered UI, or text inside images. Each result includes a ready-to-use tap point. Pair with tap_screen to tap recognized text.",
+            @"description": @"Recognize screen text locally and return screen-point rects and tap points. engine defaults to paddleocr per request, using bundled PP-OCRv5 mobile models with ONNX Runtime CPU only. Set engine=vision for Apple Vision. No cross-engine fallback. Use for text missing from the accessibility tree.",
             @"inputSchema": @{
                 @"type": @"object",
                 @"properties": @{
-                    @"languages": @{@"type": @"array", @"items": @{@"type": @"string"}, @"description": @"Recognition languages in priority order. Put Chinese first to recognize Chinese, e.g. ['zh-Hans','en-US'] (default). Unsupported languages return an error."},
-                    @"min_confidence": @{@"type": @"number", @"description": @"Drop results below this confidence 0..1 (default 0.3)."},
+                    @"engine": @{@"type": @"string", @"enum": @[@"vision", @"paddleocr"], @"default": [OCRManager defaultEngine], @"description": @"Current request only. Omitted always means paddleocr; set vision for Apple Vision. Errors never switch engine."},
+                    @"languages": @{@"type": @"array", @"items": @{@"type": @"string"}, @"description": @"Vision defaults to supported Chinese+English on iOS 14+, English on iOS 13. Explicit unsupported languages fail. PaddleOCR uses one Chinese+English model; language hints do not restrict its alphabet."},
+                    @"min_confidence": @{@"type": @"number", @"description": @"Drop results below 0..1 (default 0.3). Vision confidence is unchanged; PaddleOCR uses mean CTC probability, not an equivalent calibrated score."},
                     @"region": @{
                         @"type": @"object",
                         @"properties": @{
@@ -2287,7 +2312,7 @@ static NSString *MCPLogId(id reqId) {
                         @"required": @[@"x", @"y", @"width", @"height"],
                         @"description": @"Optional screen-point rect {x,y,width,height}. All fields must be finite numbers and width/height must be positive. Partly off-screen regions are clipped; wholly off-screen regions return empty texts. Omit for full-screen OCR."
                     },
-                    @"fast": @{@"type": @"boolean", @"default": @YES, @"description": @"Prefer fast recognition (default true). Automatically uses accurate when fast does not support the requested languages (e.g. Chinese, included in the default languages). Set languages to ['en-US'] for fast English OCR. Accurate recognition runs directly on CPU. The recognition field reports the actual mode and CPU configuration."}
+                    @"fast": @{@"type": @"boolean", @"default": @YES, @"description": @"Vision speed preference (default true); uses accurate if required for the languages. Accurate runs on CPU. PaddleOCR always uses the same mobile model regardless of fast, reported in recognition.adjustments."}
                 }
             }
         },
@@ -2299,6 +2324,7 @@ static NSString *MCPLogId(id reqId) {
                 @"properties": @{
                     @"include_screenshot": @{@"type": @"boolean", @"description": @"Include a base64 JPEG screenshot (default false, saves tokens)."},
                     @"include_ocr": @{@"type": @"boolean", @"description": @"Add an OCR text layer for content not in the accessibility tree (default false)."},
+                    @"engine": @{@"type": @"string", @"enum": @[@"vision", @"paddleocr"], @"default": [OCRManager defaultEngine], @"description": @"OCR engine for this request when include_ocr is true. Omitted always means paddleocr; set vision for Apple Vision. No fallback."},
                     @"clickable_only": @{@"type": @"boolean", @"description": @"Only return clickable elements (default true)."}
                 }
             }
@@ -2471,11 +2497,11 @@ static NSString *MCPLogId(id reqId) {
         // ---- App install/uninstall tools ----
         @{
             @"name": @"install_app",
-            @"description": @"Install an IPA or DEB package that already exists on the device filesystem. If the file is on the computer, first upload it with POST /upload_file using raw bytes, for example: curl -H 'X-Filename: app.ipa' --data-binary @app.ipa http://device-ip:<server-port>/upload_file or curl -H 'X-Filename: package.deb' --data-binary @package.deb http://device-ip:<server-port>/upload_file. The upload response returns a device path such as /var/mobile/Library/Caches/ios-mcp-uploads/<id>-app.ipa; pass that path to install_app. IPA files use the app install flow and support unsigned or fakesigned IPAs. DEB files are installed with dpkg and trigger a SpringBoard restart after installation succeeds.",
+            @"description": @"Install an IPA, TIPA or DEB package that already exists on the device filesystem. If the file is on the computer, first upload it with POST /upload_file using raw bytes, for example: curl -H 'X-Filename: app.ipa' --data-binary @app.ipa http://device-ip:<server-port>/upload_file or curl -H 'X-Filename: package.deb' --data-binary @package.deb http://device-ip:<server-port>/upload_file. The upload response returns a device path such as /var/mobile/Library/Caches/ios-mcp-uploads/<id>-app.ipa; pass that path to install_app. IPA and TIPA files use the same app install flow and support unsigned or fakesigned IPAs. DEB files are installed with dpkg and trigger a SpringBoard restart after installation succeeds.",
             @"inputSchema": @{
                 @"type": @"object",
                 @"properties": @{
-                    @"path": @{@"type": @"string", @"description": @"Absolute path to the .ipa or .deb file already on device (e.g. /var/mobile/Library/Caches/ios-mcp-uploads/app.ipa, /var/mobile/Library/Caches/ios-mcp-uploads/package.deb, or /var/tmp/package.deb). For a computer-local file, POST raw bytes to /upload_file first and use the returned path."}
+                    @"path": @{@"type": @"string", @"description": @"Absolute path to the .ipa, .tipa or .deb file (case-insensitive extension) already on device (e.g. /var/mobile/Library/Caches/ios-mcp-uploads/app.ipa, /var/mobile/Library/Caches/ios-mcp-uploads/app.tipa, or /var/tmp/package.deb). For a computer-local file, POST raw bytes to /upload_file first and use the returned path."}
                 },
                 @"required": @[@"path"]
             }
@@ -3605,6 +3631,9 @@ static NSString *MCPLogId(id reqId) {
 
 - (NSDictionary *)executeOCRScreen:(id)reqId args:(NSDictionary *)args {
     NSString *paramError = nil;
+    if (![OCRManager validateEngine:args[@"engine"] error:&paramError]) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
     double minConfidence = 0.3;
     if (!MCPNumberFromArgs(args, @"min_confidence", 0.3, NO, &minConfidence, &paramError)) {
         return [self mcpError:reqId code:-32602 message:paramError];
@@ -3633,6 +3662,7 @@ static NSString *MCPLogId(id reqId) {
                                                                     minConfidence:minConfidence
                                                                            region:region
                                                                              fast:fast
+                                                                           engine:args[@"engine"]
                                                                             error:&err];
     if (!result) {
         return [self mcpSuccess:reqId text:(err ?: @"OCR failed") isError:YES];
@@ -3642,6 +3672,9 @@ static NSString *MCPLogId(id reqId) {
 
 - (NSDictionary *)executeDescribeScreen:(id)reqId args:(NSDictionary *)args {
     NSString *paramError = nil;
+    if (![OCRManager validateEngine:args[@"engine"] error:&paramError]) {
+        return [self mcpError:reqId code:-32602 message:paramError];
+    }
     BOOL includeScreenshot = NO, includeOCR = NO, clickableOnly = YES;
     if (!MCPBoolFromArgs(args, @"include_screenshot", NO, &includeScreenshot, &paramError) ||
         !MCPBoolFromArgs(args, @"include_ocr", NO, &includeOCR, &paramError) ||
@@ -3689,6 +3722,7 @@ static NSString *MCPLogId(id reqId) {
                                                                       minConfidence:0.3
                                                                              region:nil
                                                                                fast:YES
+                                                                             engine:args[@"engine"]
                                                                               error:&ocrErr];
         if ([ocr[@"texts"] isKindOfClass:[NSArray class]]) {
             out[@"ocr_texts"] = ocr[@"texts"];

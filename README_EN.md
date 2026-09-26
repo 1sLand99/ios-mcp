@@ -24,6 +24,15 @@ iOS MCP is an [MCP (Model Context Protocol)](https://modelcontextprotocol.io) se
 
 **46** MCP tools covering the major iOS device automation and reverse-engineering scenarios.
 
+`install_app` supports `.ipa`, `.tipa`, and `.deb` (case-insensitive extensions). `.tipa` uses the IPA install flow.
+For computer-local files, upload through `POST /upload_file` first, then pass the returned device path to `install_app`.
+
+`ocr_screen` and `describe_screen(include_ocr=true)` accept an optional `engine`:
+omitted/`"paddleocr"` uses offline PaddleOCR with ONNX Runtime CPU;
+`"vision"` uses Apple Vision. Selection is per request, with no automatic engine fallback.
+Vision defaults to English on iOS 13; PaddleOCR supports Chinese, English and digits.
+See [OCR engines, build instructions and validation](docs/PADDLEOCR.md).
+
 ## Runtime Requirements
 
 - Jailbroken iOS device
@@ -72,7 +81,7 @@ http://DEVICE_IP:8090/health
 3. If you get the following response, the service is running correctly:
 
 ```json
-{"status":"ok","server":"ios-mcp","version":"1.2.6","protocolVersion":"2025-11-25","supportedProtocolVersions":["2025-11-25","2025-06-18","2025-03-26"]}
+{"status":"ok","server":"ios-mcp","version":"1.2.7","protocolVersion":"2025-11-25","supportedProtocolVersions":["2025-11-25","2025-06-18","2025-03-26"]}
 ```
 
 ## Usage

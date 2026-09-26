@@ -1906,8 +1906,11 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
     if ([extension isEqualToString:@"deb"]) {
         return [self installDebPackage:packagePath error:error];
     }
-    if (![extension isEqualToString:@"ipa"]) {
-        if (error) *error = [NSString stringWithFormat:@"Unsupported package extension: .%@ (expected .ipa or .deb)", extension.length ? extension : @"<none>"];
+    // TIPA is an IPA archive with a different extension. Use the same helpers
+    // and Customer package type, including the LSApplicationWorkspace fallback.
+    BOOL isIPA = [extension isEqualToString:@"ipa"] || [extension isEqualToString:@"tipa"];
+    if (!isIPA) {
+        if (error) *error = [NSString stringWithFormat:@"Unsupported package extension: .%@ (expected .ipa, .tipa or .deb)", extension.length ? extension : @"<none>"];
         return NO;
     }
 
@@ -1995,7 +1998,6 @@ static BOOL MCPWaitForURLOpenVerification(NSURL *url, NSString *previousBundleId
     }
 
     // Method 2: LSApplicationWorkspace (works when AppSync hooks installd)
-    BOOL isIPA = [[ipaPath pathExtension].lowercaseString isEqualToString:@"ipa"];
     NSString *packageType = isIPA ? @"Customer" : @"Developer";
 
     __block BOOL ok = NO;

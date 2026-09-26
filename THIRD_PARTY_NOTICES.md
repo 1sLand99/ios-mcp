@@ -18,6 +18,17 @@ This is an engineering compliance summary, not legal advice.
 | libplist | `third_party/procursus-sdk/iphoneos-arm64/usr/include/plist/` and `third_party/procursus-sdk/iphoneos-arm64/usr/lib/libplist-2.0.a` | Property-list support for `mcp-ldid` | LGPL-2.1-or-later. See license notice in `third_party/procursus-sdk/iphoneos-arm64/usr/include/plist/plist.h`. |
 | libzip | `AppSync/appinst/zip.h`; linked from `$(THEOS)/lib/libzip.a` when building `mcp-appinst` and `mcp-roothelper` | IPA/ZIP archive inspection and extraction | BSD-style 3-clause license. See the notice in `AppSync/appinst/zip.h`. |
 
+## PaddleOCR engine components
+
+The optional PaddleOCR engine bundles PP-OCRv5 mobile models (Apache-2.0),
+ONNX Runtime 1.20.1 (MIT), OpenCV 4.10.0 core/imgproc (Apache-2.0), and
+Clipper 6.4.2 (Boost Software License 1.0). ONNX Runtime's dependencies include
+Eigen (MPL-2.0); upstream notices are retained. Sources, immutable model revisions,
+checksums and reproducible build steps are in `third_party/paddleocr/` and
+`docs/PADDLEOCR.md`. Clipper's only local adaptation changes its header include path.
+License texts and ONNX Runtime's full third-party notices are installed under
+`/usr/share/doc/ios-mcp/paddleocr/`. Retain them when redistributing binaries.
+
 ## External Build Or Runtime Dependencies
 
 These components are required by the build or runtime environment but are not

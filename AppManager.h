@@ -22,7 +22,7 @@
 /// Open a URL (supports URL schemes like http://, tel://, etc.)
 - (BOOL)openURL:(NSString *)urlString error:(NSString **)error;
 
-/// Install an IPA or DEB package from the given path on device
+/// Install an IPA (.ipa/.tipa) or DEB package from the given path on device
 - (BOOL)installApp:(NSString *)packagePath error:(NSString **)error;
 
 /// Uninstall an app by bundle identifier or a DEB package by package identifier

@@ -1,0 +1,7 @@
+{
+  "det.onnx": "a431985659dc921974177a95adcfbb90fd9e51989a5e04d70d0b75f597b6e61d",
+  "det.yml": "98069072e1b6b37d727fd9d9f11725faa46d6ea0de012f2ed26caea011c37699",
+  "dictionary.json": "43308a883b3ec2c074b97515e392ad1c4c18b227abfffbd0030fc163dcdd4477",
+  "rec.onnx": "da72dc72ca4dc220df0dfde68c1dedc31c58d3e76a25871122e5056227d50092",
+  "rec.yml": "5dfeb2777f6d0db8177d8128a8acfcf6e6276dc4ac73ea3bf0dc06d6a5e85d8e"
+}
