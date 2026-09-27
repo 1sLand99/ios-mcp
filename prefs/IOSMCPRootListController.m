@@ -1,4 +1,5 @@
 #import "IOSMCPRootListController.h"
+#import "IOSMCPLocalization.h"
 #import <Preferences/PSSpecifier.h>
 #import <Preferences/PSTableCell.h>
 #import <UIKit/UIKit.h>
@@ -106,6 +107,20 @@ static BOOL IOSMCPEnabledPreference(void) {
 - (NSArray *)specifiers {
     if (!_specifiers) {
         _specifiers = [self loadSpecifiersFromPlistName:@"Root" target:self];
+        // Root.plist supplies the source strings. Localize every visible property,
+        // including custom-cell captions; preference keys/actions stay unchanged.
+        for (PSSpecifier *specifier in _specifiers) {
+            if (specifier.name.length) {
+                specifier.name = IOSMCPLocalizedString(specifier.name);
+                [specifier setProperty:specifier.name forKey:PSTitleKey];
+            }
+            for (NSString *property in @[PSFooterTextGroupKey, @"placeholder", @"caption"]) {
+                id value = [specifier propertyForKey:property];
+                if ([value isKindOfClass:NSString.class] && [value length]) {
+                    [specifier setProperty:IOSMCPLocalizedString(value) forKey:property];
+                }
+            }
+        }
     }
 
     return _specifiers;
@@ -121,7 +136,10 @@ static BOOL IOSMCPEnabledPreference(void) {
     if (tintColor) {
         [respringButton setTitleColor:tintColor forState:UIControlStateNormal];
     }
-    [respringButton setTitle:@"重启" forState:UIControlStateNormal];
+    [respringButton setTitle:IOSMCPLocalizedString(@"重启") forState:UIControlStateNormal];
+    // The English title is wider than the original two-character Chinese label.
+    CGSize buttonSize = [respringButton sizeThatFits:CGSizeMake(CGFLOAT_MAX, 44.0)];
+    respringButton.frame = CGRectMake(0.0, 0.0, MAX(52.0, ceil(buttonSize.width)), 44.0);
     [respringButton addTarget:self
                        action:@selector(respringButtonTapped:)
              forControlEvents:UIControlEventTouchUpInside];
@@ -186,8 +204,8 @@ static BOOL IOSMCPEnabledPreference(void) {
     });
 
     if (!validPort) {
-        [self showAlertWithTitle:@"端口无效"
-                         message:[NSString stringWithFormat:@"端口必须在 %d-%d 之间，已恢复为默认端口 %d。",
+        [self showAlertWithTitle:IOSMCPLocalizedString(@"端口无效")
+                         message:[NSString stringWithFormat:IOSMCPLocalizedString(@"端口必须在 %d-%d 之间，已恢复为默认端口 %d。"),
                                   IOS_MCP_MIN_PORT,
                                   IOS_MCP_MAX_PORT,
                                   IOS_MCP_DEFAULT_PORT]];
@@ -213,8 +231,8 @@ static BOOL IOSMCPEnabledPreference(void) {
     [self setServerControlBusyState:YES];
     [self updateEnabledPreference:shouldStart];
     [self postNotification:shouldStart ? IOS_MCP_DARWIN_NOTIFICATION_START : IOS_MCP_DARWIN_NOTIFICATION_STOP];
-    [self updateControlStatusText:shouldStart ? [NSString stringWithFormat:@"当前状态：正在启动端口 %u...", (unsigned int)port] : @"当前状态：正在关闭..."
-                      buttonTitle:shouldStart ? @"正在启动..." : @"正在关闭..."
+    [self updateControlStatusText:shouldStart ? [NSString stringWithFormat:IOSMCPLocalizedString(@"当前状态：正在启动端口 %u..."), (unsigned int)port] : IOSMCPLocalizedString(@"当前状态：正在关闭...")
+                      buttonTitle:shouldStart ? IOSMCPLocalizedString(@"正在启动...") : IOSMCPLocalizedString(@"正在关闭...")
                     buttonEnabled:YES];
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1000 * NSEC_PER_MSEC)),
@@ -236,7 +254,7 @@ static BOOL IOSMCPEnabledPreference(void) {
 - (void)copyPrompt:(PSSpecifier *)specifier {
     NSString *prompt = [self codexPrompt];
     if (prompt.length == 0) {
-        [self showAlertWithTitle:@"分享失败" message:@"无法生成 MCP 提示词片段。"];
+        [self showAlertWithTitle:IOSMCPLocalizedString(@"分享失败") message:IOSMCPLocalizedString(@"无法生成 MCP 提示词片段。")];
         return;
     }
 
@@ -255,9 +273,9 @@ static BOOL IOSMCPEnabledPreference(void) {
     NSMutableArray<NSDictionary<NSString *, NSString *> *> *logFiles = [NSMutableArray array];
     NSArray<NSString *> *paths = [MCPLogger allLogFilePaths];
     for (NSUInteger index = 0; index < paths.count; index++) {
-        NSString *title = @"当前日志";
+        NSString *title = IOSMCPLocalizedString(@"当前日志");
         if (index == 1) {
-            title = @"上一份日志";
+            title = IOSMCPLocalizedString(@"上一份日志");
         }
         [logFiles addObject:@{@"path": paths[index], @"title": title}];
     }
@@ -273,16 +291,16 @@ static BOOL IOSMCPEnabledPreference(void) {
                             attributes:nil
                                  error:&createError]) {
             dispatch_async(dispatch_get_main_queue(), ^{
-                [self showAlertWithTitle:@"分享失败"
-                                 message:createError.localizedDescription ?: @"无法准备 Debug 日志文件。"];
+                [self showAlertWithTitle:IOSMCPLocalizedString(@"分享失败")
+                                 message:createError.localizedDescription ?: IOSMCPLocalizedString(@"无法准备 Debug 日志文件。")];
             });
             return;
         }
 
         __block BOOL hasLogFile = NO;
         NSMutableString *report = [NSMutableString stringWithString:
-                                   @"iOS MCP Debug 日志\n"
-                                   @"此文件由 iOS MCP 设置页导出，用于排查服务启动、HTTP 请求、MCP 工具调用、耗时和错误。\n\n"];
+                                   IOSMCPLocalizedString(@"iOS MCP Debug 日志\n"
+                                   @"此文件由 iOS MCP 设置页导出，用于排查服务启动、HTTP 请求、MCP 工具调用、耗时和错误。\n\n")];
         for (NSDictionary<NSString *, NSString *> *entry in logFiles) {
             NSString *sourcePath = entry[@"path"];
             NSString *title = entry[@"title"];
@@ -298,23 +316,23 @@ static BOOL IOSMCPEnabledPreference(void) {
                                                     error:&readError];
             NSString *body = nil;
             if (!data) {
-                body = [NSString stringWithFormat:@"无法读取日志文件。\n错误：%@\n",
-                        readError.localizedDescription ?: @"未知错误"];
+                body = [NSString stringWithFormat:IOSMCPLocalizedString(@"无法读取日志文件。\n错误：%@\n"),
+                        readError.localizedDescription ?: IOSMCPLocalizedString(@"未知错误")];
             } else if (data.length > 0 && memchr(data.bytes, 0, data.length) != NULL) {
-                body = [NSString stringWithFormat:@"日志文件包含不可显示内容，未直接导出原始内容。\n大小：%llu bytes\n",
+                body = [NSString stringWithFormat:IOSMCPLocalizedString(@"日志文件包含不可显示内容，未直接导出原始内容。\n大小：%llu bytes\n"),
                         (unsigned long long)data.length];
             } else {
                 body = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
                 if (!body) {
-                    body = [NSString stringWithFormat:@"日志文件不是有效 UTF-8 文本。\n大小：%llu bytes\n",
+                    body = [NSString stringWithFormat:IOSMCPLocalizedString(@"日志文件不是有效 UTF-8 文本。\n大小：%llu bytes\n"),
                             (unsigned long long)data.length];
                 } else if (body.length == 0) {
-                    body = @"日志文件为空。\n";
+                    body = IOSMCPLocalizedString(@"日志文件为空。\n");
                 }
             }
 
-            [report appendFormat:@"## %@\n路径：%@\n\n%@\n\n",
-             title ?: @"日志",
+            [report appendFormat:IOSMCPLocalizedString(@"## %@\n路径：%@\n\n%@\n\n"),
+             title ?: IOSMCPLocalizedString(@"日志"),
              sourcePath,
              body ?: @""];
         }
@@ -339,8 +357,8 @@ static BOOL IOSMCPEnabledPreference(void) {
 
         dispatch_async(dispatch_get_main_queue(), ^{
             if (!hasLogFile) {
-                [self showAlertWithTitle:@"没有日志"
-                                 message:@"当前还没有可分享的 Debug 日志文件。"];
+                [self showAlertWithTitle:IOSMCPLocalizedString(@"没有日志")
+                                 message:IOSMCPLocalizedString(@"当前还没有可分享的 Debug 日志文件。")];
                 return;
             }
 
@@ -362,8 +380,8 @@ static BOOL IOSMCPEnabledPreference(void) {
             }
 
             if (!wroteReport) {
-                [self showAlertWithTitle:@"分享失败"
-                                 message:writeError.localizedDescription ?: @"无法准备 Debug 日志文件。"];
+                [self showAlertWithTitle:IOSMCPLocalizedString(@"分享失败")
+                                 message:writeError.localizedDescription ?: IOSMCPLocalizedString(@"无法准备 Debug 日志文件。")];
                 return;
             }
 
@@ -535,7 +553,7 @@ static BOOL IOSMCPEnabledPreference(void) {
 
 - (void)presentPromptShareSheetWithText:(NSString *)prompt sourceCell:(UITableViewCell *)sourceCell {
     if (prompt.length == 0) {
-        [self showAlertWithTitle:@"分享失败" message:@"无法生成 MCP 提示词片段。"];
+        [self showAlertWithTitle:IOSMCPLocalizedString(@"分享失败") message:IOSMCPLocalizedString(@"无法生成 MCP 提示词片段。")];
         return;
     }
 
@@ -580,7 +598,7 @@ static BOOL IOSMCPEnabledPreference(void) {
 
 - (void)presentDebugLogShareSheetWithURL:(NSURL *)reportURL sourceCell:(UITableViewCell *)sourceCell {
     if (!reportURL) {
-        [self showAlertWithTitle:@"分享失败" message:@"无法准备 Debug 日志文件。"];
+        [self showAlertWithTitle:IOSMCPLocalizedString(@"分享失败") message:IOSMCPLocalizedString(@"无法准备 Debug 日志文件。")];
         return;
     }
 
@@ -593,7 +611,7 @@ static BOOL IOSMCPEnabledPreference(void) {
                                                    encoding:NSUTF8StringEncoding
                                                       error:NULL];
     if (shareText.length == 0) {
-        [self showAlertWithTitle:@"分享失败" message:@"无法读取 Debug 日志内容。"];
+        [self showAlertWithTitle:IOSMCPLocalizedString(@"分享失败") message:IOSMCPLocalizedString(@"无法读取 Debug 日志内容。")];
         return;
     }
 
@@ -643,7 +661,7 @@ static BOOL IOSMCPEnabledPreference(void) {
     // suggestedName，走进程内路径分享，既不卡死，又能让“存储到文件”得到正确文件名。
     NSData *zipData = zipURL ? [NSData dataWithContentsOfURL:zipURL] : nil;
     if (zipData.length == 0) {
-        [self showAlertWithTitle:@"分享失败" message:@"无法读取 Debug 日志压缩包。"];
+        [self showAlertWithTitle:IOSMCPLocalizedString(@"分享失败") message:IOSMCPLocalizedString(@"无法读取 Debug 日志压缩包。")];
         return;
     }
 
@@ -703,27 +721,27 @@ static BOOL IOSMCPEnabledPreference(void) {
 - (void)clearDebugLogs:(PSSpecifier *)specifier {
     NSError *error = nil;
     if ([MCPLogger clearLogsWithError:&error]) {
-        [self showAlertWithTitle:@"已清空"
-                         message:@"Debug 日志文件已清空。"];
+        [self showAlertWithTitle:IOSMCPLocalizedString(@"已清空")
+                         message:IOSMCPLocalizedString(@"Debug 日志文件已清空。")];
         [self refreshDebugLogFooter];
         return;
     }
 
-    [self showAlertWithTitle:@"清空失败"
-                     message:error.localizedDescription ?: @"无法清空 Debug 日志文件。"];
+    [self showAlertWithTitle:IOSMCPLocalizedString(@"清空失败")
+                     message:error.localizedDescription ?: IOSMCPLocalizedString(@"无法清空 Debug 日志文件。")];
 }
 
 - (void)respringButtonTapped:(id)sender {
-    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"重启 SpringBoard"
-                                                                  message:@"确定要重启 SpringBoard 吗？重启后需要重新解锁设备。"
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:IOSMCPLocalizedString(@"重启 SpringBoard")
+                                                                  message:IOSMCPLocalizedString(@"确定要重启 SpringBoard 吗？重启后需要重新解锁设备。")
                                                            preferredStyle:UIAlertControllerStyleAlert];
-    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [alert addAction:[UIAlertAction actionWithTitle:@"重启" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *action) {
+    [alert addAction:[UIAlertAction actionWithTitle:IOSMCPLocalizedString(@"取消") style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:IOSMCPLocalizedString(@"重启") style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction *action) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(300 * NSEC_PER_MSEC)), dispatch_get_main_queue(), ^{
             NSString *killallPath = IOSMCPKillallPath();
             if (!killallPath.length) {
                 [MCPLogger log:@"prefs_respring failed reason=missing_killall"];
-                [self showAlertWithTitle:@"重启失败" message:@"未找到可执行的 killall。"];
+                [self showAlertWithTitle:IOSMCPLocalizedString(@"重启失败") message:IOSMCPLocalizedString(@"未找到可执行的 killall。")];
                 return;
             }
 
@@ -737,8 +755,8 @@ static BOOL IOSMCPEnabledPreference(void) {
                                      NULL);
             if (status != 0) {
                 [MCPLogger log:@"prefs_respring failed status=%d error=%s", status, strerror(status)];
-                [self showAlertWithTitle:@"重启失败"
-                                 message:[NSString stringWithFormat:@"无法执行 killall：%s", strerror(status)]];
+                [self showAlertWithTitle:IOSMCPLocalizedString(@"重启失败")
+                                 message:[NSString stringWithFormat:IOSMCPLocalizedString(@"无法执行 killall：%s"), strerror(status)]];
                 return;
             }
 
@@ -751,7 +769,7 @@ static BOOL IOSMCPEnabledPreference(void) {
 - (void)openAuthorPage:(PSSpecifier *)specifier {
     NSURL *url = [NSURL URLWithString:@"https://mp.weixin.qq.com/s/WERMNPzW6WV5YGFthVqCRg"];
     if (!url) {
-        [self showAlertWithTitle:@"打开失败" message:@"链接无效。"];
+        [self showAlertWithTitle:IOSMCPLocalizedString(@"打开失败") message:IOSMCPLocalizedString(@"链接无效。")];
         return;
     }
 
@@ -762,7 +780,7 @@ static BOOL IOSMCPEnabledPreference(void) {
            completionHandler:^(BOOL success) {
             if (!success) {
                 dispatch_async(dispatch_get_main_queue(), ^{
-                    [self showAlertWithTitle:@"打开失败" message:@"无法打开作者页面。"];
+                    [self showAlertWithTitle:IOSMCPLocalizedString(@"打开失败") message:IOSMCPLocalizedString(@"无法打开作者页面。")];
                 });
             }
         }];
@@ -774,7 +792,7 @@ static BOOL IOSMCPEnabledPreference(void) {
     BOOL opened = [application openURL:url];
 #pragma clang diagnostic pop
     if (!opened) {
-        [self showAlertWithTitle:@"打开失败" message:@"无法打开作者页面。"];
+        [self showAlertWithTitle:IOSMCPLocalizedString(@"打开失败") message:IOSMCPLocalizedString(@"无法打开作者页面。")];
     }
 }
 
@@ -791,11 +809,11 @@ static BOOL IOSMCPEnabledPreference(void) {
 
         self.serverRunning = running;
         NSString *stoppedText = (error.code == NSURLErrorTimedOut)
-            ? [NSString stringWithFormat:@"当前状态：端口 %u 无响应", (unsigned int)port]
-            : [NSString stringWithFormat:@"当前状态：未运行（端口 %u）", (unsigned int)port];
-        [self updateControlStatusText:running ? [NSString stringWithFormat:@"当前状态：运行中（端口 %u）", (unsigned int)port]
+            ? [NSString stringWithFormat:IOSMCPLocalizedString(@"当前状态：端口 %u 无响应"), (unsigned int)port]
+            : [NSString stringWithFormat:IOSMCPLocalizedString(@"当前状态：未运行（端口 %u）"), (unsigned int)port];
+        [self updateControlStatusText:running ? [NSString stringWithFormat:IOSMCPLocalizedString(@"当前状态：运行中（端口 %u）"), (unsigned int)port]
                                              : stoppedText
-                              buttonTitle:running ? @"关闭 iOS MCP" : @"启动 iOS MCP"
+                              buttonTitle:running ? IOSMCPLocalizedString(@"关闭 iOS MCP") : IOSMCPLocalizedString(@"启动 iOS MCP")
                             buttonEnabled:YES];
         [self setServerControlBusyState:NO];
     }];
@@ -849,11 +867,11 @@ static BOOL IOSMCPEnabledPreference(void) {
         self.serverStatusGeneration++;
         self.serverRunning = running;
         NSString *stoppedText = (error.code == NSURLErrorTimedOut)
-            ? [NSString stringWithFormat:@"当前状态：端口 %u 无响应", (unsigned int)port]
-            : [NSString stringWithFormat:@"当前状态：未运行（端口 %u）", (unsigned int)port];
-        [self updateControlStatusText:running ? [NSString stringWithFormat:@"当前状态：运行中（端口 %u）", (unsigned int)port]
+            ? [NSString stringWithFormat:IOSMCPLocalizedString(@"当前状态：端口 %u 无响应"), (unsigned int)port]
+            : [NSString stringWithFormat:IOSMCPLocalizedString(@"当前状态：未运行（端口 %u）"), (unsigned int)port];
+        [self updateControlStatusText:running ? [NSString stringWithFormat:IOSMCPLocalizedString(@"当前状态：运行中（端口 %u）"), (unsigned int)port]
                                              : stoppedText
-                              buttonTitle:running ? @"关闭 iOS MCP" : @"启动 iOS MCP"
+                              buttonTitle:running ? IOSMCPLocalizedString(@"关闭 iOS MCP") : IOSMCPLocalizedString(@"启动 iOS MCP")
                             buttonEnabled:YES];
         [self setServerControlBusyState:NO];
     }];
@@ -873,8 +891,8 @@ static BOOL IOSMCPEnabledPreference(void) {
 
     NSUInteger generation = ++self.serverStatusGeneration;
     [self setServerControlBusyState:YES];
-    [self updateControlStatusText:[NSString stringWithFormat:@"当前状态：正在切换到端口 %u...", (unsigned int)newPort]
-                      buttonTitle:@"正在切换..."
+    [self updateControlStatusText:[NSString stringWithFormat:IOSMCPLocalizedString(@"当前状态：正在切换到端口 %u..."), (unsigned int)newPort]
+                      buttonTitle:IOSMCPLocalizedString(@"正在切换...")
                     buttonEnabled:YES];
     // START is handled as a serialized restart in SpringBoard. Do not guess
     // when an asynchronous dispatch-source cancellation has closed the old fd.
@@ -1177,10 +1195,10 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherG
 
     NSString *lastError = [MCPLogger lastLogError];
     NSString *footer = [NSString stringWithFormat:
-                        @"开启后会把服务启动、HTTP 请求、MCP 工具调用、耗时和错误写入文件，便于排查问题。不会记录截图内容、UI 树完整内容、剪贴板、输入文本或请求 body。\n\n当前日志：%@\n上一份日志：%@%@",
+                        IOSMCPLocalizedString(@"开启后会把服务启动、HTTP 请求、MCP 工具调用、耗时和错误写入文件，便于排查问题。不会记录截图内容、UI 树完整内容、剪贴板、输入文本或请求 body。\n\n当前日志：%@\n上一份日志：%@%@"),
                         [MCPLogger logFilePath],
                         [MCPLogger previousLogFilePath],
-                        lastError.length ? [NSString stringWithFormat:@"\n最近写入错误：%@", lastError] : @""];
+                        lastError.length ? [NSString stringWithFormat:IOSMCPLocalizedString(@"\n最近写入错误：%@"), lastError] : @""];
     [debugSpecifier setProperty:footer forKey:PSFooterTextGroupKey];
     [self reloadSpecifier:debugSpecifier animated:NO];
 }
@@ -1238,22 +1256,9 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherG
 }
 
 - (NSString *)codexPrompt {
+    NSString *promptFormat = IOSMCPLocalizedString(@"MCP_PROMPT");
     return [NSString stringWithFormat:
-            @"你可以通过 iOS MCP 服务操作一台 iPhone 设备。各工具的功能和参数见工具列表，这里只列使用时容易踩的坑和约定。\n\n"
-            @"MCP 地址: %@\n\n"
-            @"使用注意事项:\n"
-            @"1. 开始操作前先用 describe_screen 了解当前屏：一次返回前台 App、可点元素和精确坐标，最省 token，是“看一眼当前屏”的默认入口。它默认不含截图和 OCR，需要时显式开 include_screenshot / include_ocr。\n"
-            @"2. 仅在需要细控时才下沉到底层读屏工具：要抓屏外/不可点节点、限制返回量、或排查“AX 为什么抓不到”时，用 get_ui_elements（visible_only / limit / debug）；AX 根本看不到的内容（游戏、Flutter/RN/Unity、Canvas、图片里的字），或只想识别某区域、快扫、指定语种时，用 ocr_screen（region / fast / languages）。\n"
-            @"3. screenshot 最占 token，仅在 AX 和 OCR 都拿不到、或确实需要看图时兜底，不要每步都截。处理结果按 image content 解析（图片 base64 在 result.content[0].data，mimeType 固定为 image/jpeg），不要读 result.content[0].text。\n"
-            @"4. 以上读屏工具坐标统一为 screen points，OCR/AX 返回的点可直接传给 tap_screen / long_press，无需换算。\n"
-            @"5. 如果 get_screen_info 显示 locked=true/screen_on=false，或截图像锁屏，不要继续普通 App 操作；直接调用 wake_and_home 唤醒并回到主屏幕，然后用 get_screen_info/describe_screen（必要时 screenshot）确认（不要用单次 press_home 代替，锁屏下它通常只是唤醒或进入解锁提示）。\n"
-            @"6. 服务端启用了锁屏保护；锁屏或熄屏时，点击、滑动、输入、启动 App、Shell 等交互/写入类工具会被拦截，只允许状态查询、截图和 wake_and_home 等恢复工具。\n"
-            @"7. 交互时优先用 tap_element 按文本/标签点击，或根据 UI 节点坐标点击，不要盲点；页面变化后重新读取 UI 节点，或用 wait_for_element 等待目标出现，再继续下一步。\n"
-            @"8. 文本输入先用 input_text；如果 input_text 失败、超时或返回 isError，立即用 type_text 输入同一段文本，不要反复调用 input_text。\n"
-            @"9. read_file 有大小上限；读大文件或二进制文件改用 GET /download_file 下载完整文件。\n"
-            @"10. 安装 IPA/DEB：电脑本地文件先 POST /upload_file，再把返回的设备路径传给 install_app（IPA 可无需签名）；卸载时 App 传 bundle_id、DEB 传 package_id。\n"
-            @"11. install_app 装 DEB 只装本地 .deb，不会自动联网下载依赖；如有第三方依赖先上传并安装依赖包。\n"
-            @"12. DEB 安装/卸载成功后会重启 SpringBoard；之后先 sleep 几秒，再单次 curl 检测 /health 恢复，例如：curl -sS --connect-timeout 3 --max-time 5 %@。确需轮询用 while/seq，不要用 for i in {1..30} 这类花括号展开。",
+            promptFormat,
             IOSMCPServiceURLString(),
             IOSMCPHealthURLString()];
 }
@@ -1262,7 +1267,7 @@ shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherG
     UIAlertController *alertController = [UIAlertController alertControllerWithTitle:title
                                                                              message:message
                                                                       preferredStyle:UIAlertControllerStyleAlert];
-    [alertController addAction:[UIAlertAction actionWithTitle:@"确定"
+    [alertController addAction:[UIAlertAction actionWithTitle:IOSMCPLocalizedString(@"确定")
                                                         style:UIAlertActionStyleDefault
                                                       handler:nil]];
     [self presentViewController:alertController animated:YES completion:nil];

@@ -1,4 +1,5 @@
 #import "IOSMCPQRCodeCell.h"
+#import "IOSMCPLocalization.h"
 #import <Preferences/PSSpecifier.h>
 
 @interface IOSMCPQRCodeCell ()
@@ -35,8 +36,9 @@
     [_cardView addSubview:_qrImageView];
 
     _captionLabel = [[UILabel alloc] initWithFrame:CGRectZero];
-    _captionLabel.text = @"微信扫码关注公众号";
+    _captionLabel.text = IOSMCPLocalizedString(@"微信扫码关注公众号");
     _captionLabel.font = [UIFont systemFontOfSize:13.0 weight:UIFontWeightRegular];
+    _captionLabel.numberOfLines = 0;
     _captionLabel.textColor = [UIColor colorWithWhite:0.45 alpha:1.0];
     _captionLabel.textAlignment = NSTextAlignmentCenter;
     [_cardView addSubview:_captionLabel];
@@ -55,7 +57,7 @@
 
     NSString *caption = [specifier propertyForKey:@"caption"];
     if ([caption isKindOfClass:[NSString class]] && caption.length > 0) {
-        self.captionLabel.text = caption;
+        self.captionLabel.text = IOSMCPLocalizedString(caption);
     }
 }
 
@@ -66,8 +68,10 @@
     CGFloat insetY = 8.0;
     self.cardView.frame = CGRectInset(self.contentView.bounds, insetX, insetY);
 
-    CGFloat captionHeight = 18.0;
     CGFloat innerInset = 12.0;
+    CGFloat captionWidth = MAX(0.0, CGRectGetWidth(self.cardView.bounds) - innerInset * 2);
+    CGFloat captionHeight = MAX(18.0, MIN(52.0, ceil([self.captionLabel sizeThatFits:
+                                                   CGSizeMake(captionWidth, CGFLOAT_MAX)].height)));
     self.captionLabel.frame = CGRectMake(innerInset,
                                          CGRectGetHeight(self.cardView.bounds) - captionHeight - 10.0,
                                          CGRectGetWidth(self.cardView.bounds) - innerInset * 2,

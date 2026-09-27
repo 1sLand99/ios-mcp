@@ -81,12 +81,14 @@ http://DEVICE_IP:8090/health
 3. If you get the following response, the service is running correctly:
 
 ```json
-{"status":"ok","server":"ios-mcp","version":"1.2.7","protocolVersion":"2025-11-25","supportedProtocolVersions":["2025-11-25","2025-06-18","2025-03-26"]}
+{"status":"ok","server":"ios-mcp","version":"1.2.8","protocolVersion":"2025-11-25","supportedProtocolVersions":["2025-11-25","2025-06-18","2025-03-26"]}
 ```
 
 ## Usage
 
-After installation, open **Settings** → **iOS MCP** on your device. Start the server, then tap "复制并分享 MCP 提示词片段" ("Copy and Share MCP Prompt Snippet") and paste it into your AI agent's prompt.
+After installation, open **Settings** → **iOS MCP** on your device. Start the server, then tap "Copy / Share MCP Prompt" and paste it into your AI agent's prompt.
+
+The settings page follows the device's preferred language: Simplified Chinese, Traditional Chinese, or English. No manual language selection is needed.
 
 <p align="center">
   <img src="screenshots/settings.jpeg" alt="iOS MCP Settings" width="300">
