@@ -87,6 +87,8 @@ http://设备IP:8090/health
 
 安装后打开设备「设置」→「iOS MCP」，启动服务后点击「复制并分享 MCP 提示词片段」，将其粘贴到你的 AI 提示词中即可。
 
+设置页跟随设备语言显示简体中文、繁体中文或英文，无需手动选择语言。
+
 <p align="center">
   <img src="screenshots/settings.jpeg" alt="iOS MCP 设置" width="300">
 </p>
